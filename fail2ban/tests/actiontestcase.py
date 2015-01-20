@@ -78,6 +78,9 @@ class CommandActionTest(LogCaptureTestCase):
 						 {'A': '<IPV4HOST>', 'PREF': 'IPV4'})
 		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<<PREF>HOST>', 'PREF': 'IPV4', 'IPV4HOST': '1.2.3.4'}),
 						 {'A': '1.2.3.4', 'PREF': 'IPV4', 'IPV4HOST': '1.2.3.4'})
+		# and when embedded tag is not straight at the beginning
+		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<IP<PREF>HOST>', 'PREF': 'V4', 'IPV4HOST': '1.2.3.4'}),
+						 {'A': '1.2.3.4', 'PREF': 'V4', 'IPV4HOST': '1.2.3.4'})
 
 	def testReplaceTag(self):
 		aInfo = {
