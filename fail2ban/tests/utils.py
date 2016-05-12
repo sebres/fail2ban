@@ -29,6 +29,7 @@ import re
 import tempfile
 import shutil
 import sys
+import signal
 import time
 import unittest
 
@@ -435,3 +436,64 @@ def assert_dict_equal(a, b):
 	assert isinstance(a, dict), "Object is not dictionary: %r" % a
 	assert isinstance(b, dict), "Object is not dictionary: %r" % b
 	assert a==b, "Dictionaries differ:\n%r !=\n%r" % (a, b)
+
+
+#
+# Server handling helpers
+#
+
+def kill_srv(pidfile):
+	def _pid_exists(pid):
+		try:
+			os.kill(pid, 0)
+			return True
+		except OSError:
+			return False
+	logSys.debug("-- cleanup: %r", (pidfile, os.path.isdir(pidfile)))
+	if os.path.isdir(pidfile):
+		piddir = pidfile
+		pidfile = piddir + "/f2b.pid"
+		if not os.path.isfile(pidfile):
+			pidfile = piddir + "/fail2ban.pid"
+	if not os.path.isfile(pidfile):
+		logSys.debug("--- cleanup: no pidfile for %r", piddir)
+		return True
+	f = pid = None
+	try:
+		logSys.debug("--- cleanup pidfile: %r", pidfile)
+		f = open(pidfile)
+		pid = f.read().split()[1]
+		pid = int(pid)
+		logSys.debug("--- cleanup pid: %r", pid)
+		if pid <= 0:
+			raise ValueError('pid %s of %s is invalid' % (pid, pidfile))
+		if not _pid_exists(pid):
+			return True
+		## try to preper stop (have signal handler):
+		os.kill(pid, signal.SIGTERM)
+		## check still exists after small timeout:
+		if not Utils.wait_for(lambda: not _pid_exists(pid), 1):
+			## try to kill hereafter:
+			os.kill(pid, signal.SIGKILL)
+		return not _pid_exists(pid)
+	except Exception as e:
+		logSys.debug(e)
+	finally:
+		if f is not None:
+			f.close()
+	return True
+
+
+def with_kill_srv(f):
+	"""Helper to decorate tests which receive in the last argument tmpdir to pass to kill_srv
+
+	To be used in tandem with @with_tmpdir
+	"""
+	@wraps(f)
+	def wrapper(self, *args):
+		pidfile = args[-1]
+		try:
+			return f(self, *args)
+		finally:
+			kill_srv(pidfile)
+	return wrapper

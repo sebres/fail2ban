@@ -28,7 +28,6 @@ import os
 import re
 import sys
 import time
-import signal
 import unittest
 
 from threading import Thread
@@ -40,6 +39,8 @@ from .. import protocol
 from ..server import server
 from ..server.utils import Utils
 from .utils import LogCaptureTestCase, logSys, with_tmpdir, shutil, logging
+from .utils import kill_srv
+from .utils import with_kill_srv
 
 
 STOCK_CONF_DIR = "config"
@@ -164,47 +165,6 @@ def _start_params(tmp, use_stock=False, logtarget="/dev/null"):
 					"--timeout", str(fail2bancmdline.MAX_WAITTIME),
 	)
 
-def _kill_srv(pidfile): # pragma: no cover
-	def _pid_exists(pid):
-		try:
-			os.kill(pid, 0)
-			return True
-		except OSError:
-			return False
-	logSys.debug("-- cleanup: %r", (pidfile, os.path.isdir(pidfile)))
-	if os.path.isdir(pidfile):
-		piddir = pidfile
-		pidfile = piddir + "/f2b.pid"
-		if not os.path.isfile(pidfile):
-			pidfile = piddir + "/fail2ban.pid"
-	if not os.path.isfile(pidfile):
-		logSys.debug("--- cleanup: no pidfile for %r", piddir)
-		return True
-	f = pid = None
-	try:
-		logSys.debug("--- cleanup pidfile: %r", pidfile)
-		f = open(pidfile)
-		pid = f.read().split()[1]
-		pid = int(pid)
-		logSys.debug("--- cleanup pid: %r", pid)
-		if pid <= 0:
-			raise ValueError('pid %s of %s is invalid' % (pid, pidfile))
-		if not _pid_exists(pid):
-			return True
-		## try to preper stop (have signal handler):
-		os.kill(pid, signal.SIGTERM)
-		## check still exists after small timeout:
-		if not Utils.wait_for(lambda: not _pid_exists(pid), 1):
-			## try to kill hereafter:
-			os.kill(pid, signal.SIGKILL)
-		return not _pid_exists(pid)
-	except Exception as e:
-		logSys.debug(e)
-	finally:
-		if f is not None:
-			f.close()
-	return True
-
 
 class Fail2banClientServerBase(LogCaptureTestCase):
 
@@ -263,115 +223,111 @@ class Fail2banClientTest(Fail2banClientServerBase):
 		self.assertLogged("logtarget")
 
 	@with_tmpdir
+	@with_kill_srv
 	def testClientStartBackgroundInside(self, tmp):
+		# use once the stock configuration (to test starting also)
+		startparams = _start_params(tmp, True)
+		# start:
+		self.assertRaises(ExitException, _exec_client,
+			(CLIENT, "-b") + startparams + ("start",))
+		# wait for server (socket and ready):
+		self._wait_for_srv(tmp, True, startparams=startparams)
+		self.assertLogged("Server ready")
+		self.assertLogged("Exit with code 0")
 		try:
-			# use once the stock configuration (to test starting also)
-			startparams = _start_params(tmp, True)
-			# start:
-			self.assertRaises(ExitException, _exec_client, 
-				(CLIENT, "-b") + startparams + ("start",))
-			# wait for server (socket and ready):
-			self._wait_for_srv(tmp, True, startparams=startparams)
-			self.assertLogged("Server ready")
-			self.assertLogged("Exit with code 0")
-			try:
-				self.assertRaises(ExitException, _exec_client, 
-					(CLIENT,) + startparams + ("echo", "TEST-ECHO",))
-				self.assertRaises(FailExitException, _exec_client, 
-					(CLIENT,) + startparams + ("~~unknown~cmd~failed~~",))
-				self.pruneLog()
-				# start again (should fail):
-				self.assertRaises(FailExitException, _exec_client, 
-					(CLIENT, "-b") + startparams + ("start",))
-				self.assertLogged("Server already running")
-			finally:
-				self.pruneLog()
-				# stop:
-				self.assertRaises(ExitException, _exec_client, 
-					(CLIENT,) + startparams + ("stop",))
-				self.assertLogged("Shutdown successful")
-				self.assertLogged("Exit with code 0")
-
+			self.assertRaises(ExitException, _exec_client,
+				(CLIENT,) + startparams + ("echo", "TEST-ECHO",))
+			self.assertRaises(FailExitException, _exec_client,
+				(CLIENT,) + startparams + ("~~unknown~cmd~failed~~",))
 			self.pruneLog()
-			# stop again (should fail):
-			self.assertRaises(FailExitException, _exec_client, 
-				(CLIENT,) + startparams + ("stop",))
-			self.assertLogged("Failed to access socket path")
-			self.assertLogged("Is fail2ban running?")
+			# start again (should fail):
+			self.assertRaises(FailExitException, _exec_client,
+				(CLIENT, "-b") + startparams + ("start",))
+			self.assertLogged("Server already running")
 		finally:
-			_kill_srv(tmp)
+			self.pruneLog()
+			# stop:
+			self.assertRaises(ExitException, _exec_client,
+				(CLIENT,) + startparams + ("stop",))
+			self.assertLogged("Shutdown successful")
+			self.assertLogged("Exit with code 0")
+
+		self.pruneLog()
+		# stop again (should fail):
+		self.assertRaises(FailExitException, _exec_client,
+			(CLIENT,) + startparams + ("stop",))
+		self.assertLogged("Failed to access socket path")
+		self.assertLogged("Is fail2ban running?")
 
 	@with_tmpdir
+	@with_kill_srv
 	def testClientStartBackgroundCall(self, tmp):
+		global INTERACT
+		startparams = _start_params(tmp, logtarget=tmp+"/f2b.log")
+		# start (in new process, using the same python version):
+		cmd = (sys.executable, os.path.join(os.path.join(BIN), CLIENT))
+		logSys.debug('Start %s ...', cmd)
+		cmd = cmd + startparams + ("--async", "start",)
+		ret = Utils.executeCmd(cmd, timeout=MAX_WAITTIME, shell=False, output=True)
+		self.assertTrue(len(ret) and ret[0])
+		# wait for server (socket and ready):
+		self._wait_for_srv(tmp, True, startparams=cmd)
+		self.assertLogged("Server ready")
+		self.pruneLog()
 		try:
-			global INTERACT
-			startparams = _start_params(tmp, logtarget=tmp+"/f2b.log")
-			# start (in new process, using the same python version):
-			cmd = (sys.executable, os.path.join(os.path.join(BIN), CLIENT))
-			logSys.debug('Start %s ...', cmd)
-			cmd = cmd + startparams + ("--async", "start",)
-			ret = Utils.executeCmd(cmd, timeout=MAX_WAITTIME, shell=False, output=True)
-			self.assertTrue(len(ret) and ret[0])
-			# wait for server (socket and ready):
-			self._wait_for_srv(tmp, True, startparams=cmd)
-			self.assertLogged("Server ready")
+			# echo from client (inside):
+			self.assertRaises(ExitException, _exec_client,
+				(CLIENT,) + startparams + ("echo", "TEST-ECHO",))
+			self.assertLogged("TEST-ECHO")
+			self.assertLogged("Exit with code 0")
 			self.pruneLog()
-			try:
-				# echo from client (inside):
-				self.assertRaises(ExitException, _exec_client, 
-					(CLIENT,) + startparams + ("echo", "TEST-ECHO",))
-				self.assertLogged("TEST-ECHO")
-				self.assertLogged("Exit with code 0")
-				self.pruneLog()
-				# interactive client chat with started server:
-				INTERACT += [
-					"echo INTERACT-ECHO",
-					"status",
-					"exit"
-				]
-				self.assertRaises(ExitException, _exec_client, 
-					(CLIENT,) + startparams + ("-i",))
-				self.assertLogged("INTERACT-ECHO")
-				self.assertLogged("Status", "Number of jail:")
-				self.assertLogged("Exit with code 0")
-				self.pruneLog()
-				# test reload and restart over interactive client:
-				INTERACT += [
-					"reload",
-					"restart",
-					"exit"
-				]
-				self.assertRaises(ExitException, _exec_client, 
-					(CLIENT,) + startparams + ("-i",))
-				self.assertLogged("Reading config files:")
-				self.assertLogged("Shutdown successful")
-				self.assertLogged("Server ready")
-				self.assertLogged("Exit with code 0")
-				self.pruneLog()
-				# test reload missing jail (interactive):
-				INTERACT += [
-					"reload ~~unknown~jail~fail~~",
-					"exit"
-				]
-				self.assertRaises(ExitException, _exec_client, 
-					(CLIENT,) + startparams + ("-i",))
-				self.assertLogged("Failed during configuration: No section: '~~unknown~jail~fail~~'")
-				self.pruneLog()
-				# test reload missing jail (direct):
-				self.assertRaises(FailExitException, _exec_client, 
-					(CLIENT,) + startparams + ("reload", "~~unknown~jail~fail~~"))
-				self.assertLogged("Failed during configuration: No section: '~~unknown~jail~fail~~'")
-				self.assertLogged("Exit with code -1")
-				self.pruneLog()
-			finally:
-				self.pruneLog()
-				# stop:
-				self.assertRaises(ExitException, _exec_client, 
-					(CLIENT,) + startparams + ("stop",))
-				self.assertLogged("Shutdown successful")
-				self.assertLogged("Exit with code 0")
+			# interactive client chat with started server:
+			INTERACT += [
+				"echo INTERACT-ECHO",
+				"status",
+				"exit"
+			]
+			self.assertRaises(ExitException, _exec_client,
+				(CLIENT,) + startparams + ("-i",))
+			self.assertLogged("INTERACT-ECHO")
+			self.assertLogged("Status", "Number of jail:")
+			self.assertLogged("Exit with code 0")
+			self.pruneLog()
+			# test reload and restart over interactive client:
+			INTERACT += [
+				"reload",
+				"restart",
+				"exit"
+			]
+			self.assertRaises(ExitException, _exec_client,
+				(CLIENT,) + startparams + ("-i",))
+			self.assertLogged("Reading config files:")
+			self.assertLogged("Shutdown successful")
+			self.assertLogged("Server ready")
+			self.assertLogged("Exit with code 0")
+			self.pruneLog()
+			# test reload missing jail (interactive):
+			INTERACT += [
+				"reload ~~unknown~jail~fail~~",
+				"exit"
+			]
+			self.assertRaises(ExitException, _exec_client,
+				(CLIENT,) + startparams + ("-i",))
+			self.assertLogged("Failed during configuration: No section: '~~unknown~jail~fail~~'")
+			self.pruneLog()
+			# test reload missing jail (direct):
+			self.assertRaises(FailExitException, _exec_client,
+				(CLIENT,) + startparams + ("reload", "~~unknown~jail~fail~~"))
+			self.assertLogged("Failed during configuration: No section: '~~unknown~jail~fail~~'")
+			self.assertLogged("Exit with code -1")
+			self.pruneLog()
 		finally:
-			_kill_srv(tmp)
+			self.pruneLog()
+			# stop:
+			self.assertRaises(ExitException, _exec_client,
+				(CLIENT,) + startparams + ("stop",))
+			self.assertLogged("Shutdown successful")
+			self.assertLogged("Exit with code 0")
 
 	def _testClientStartForeground(self, tmp, startparams, phase):
 		# start and wait to end (foreground):
@@ -419,50 +375,47 @@ class Fail2banClientTest(Fail2banClientServerBase):
 				self.assertTrue(phase.get('end', None))
 				self.assertLogged("Shutdown successful", "Exiting Fail2ban")
 		finally:
-			_kill_srv(tmp)
+			kill_srv(tmp)
 			if th:
 				th.join()
 
 	@with_tmpdir
+	@with_kill_srv
 	def testClientFailStart(self, tmp):
-		try:
-			# started directly here, so prevent overwrite test cases logger with "INHERITED"
-			startparams = _start_params(tmp, logtarget="INHERITED")
+		# started directly here, so prevent overwrite test cases logger with "INHERITED"
+		startparams = _start_params(tmp, logtarget="INHERITED")
 
-			## wrong config directory
-			self.assertRaises(FailExitException, _exec_client, 
-				(CLIENT, "--async", "-c", tmp+"/miss", "start",))
-			self.assertLogged("Base configuration directory " + tmp+"/miss" + " does not exist")
-			self.pruneLog()
+		## wrong config directory
+		self.assertRaises(FailExitException, _exec_client,
+			(CLIENT, "--async", "-c", tmp+"/miss", "start",))
+		self.assertLogged("Base configuration directory " + tmp+"/miss" + " does not exist")
+		self.pruneLog()
 
-			## wrong socket
-			self.assertRaises(FailExitException, _exec_client, 
-				(CLIENT, "--async", "-c", tmp+"/config", "-s", tmp+"/miss/f2b.sock", "start",))
-			self.assertLogged("There is no directory " + tmp+"/miss" + " to contain the socket file")
-			self.pruneLog()
+		## wrong socket
+		self.assertRaises(FailExitException, _exec_client,
+			(CLIENT, "--async", "-c", tmp+"/config", "-s", tmp+"/miss/f2b.sock", "start",))
+		self.assertLogged("There is no directory " + tmp+"/miss" + " to contain the socket file")
+		self.pruneLog()
 
-			## not running
-			self.assertRaises(FailExitException, _exec_client, 
-				(CLIENT, "-c", tmp+"/config", "-s", tmp+"/f2b.sock", "reload",))
-			self.assertLogged("Could not find server")
-			self.pruneLog()
+		## not running
+		self.assertRaises(FailExitException, _exec_client,
+			(CLIENT, "-c", tmp+"/config", "-s", tmp+"/f2b.sock", "reload",))
+		self.assertLogged("Could not find server")
+		self.pruneLog()
 
-			## already exists:
-			open(tmp+"/f2b.sock", 'a').close()
-			self.assertRaises(FailExitException, _exec_client, 
-				(CLIENT, "--async", "-c", tmp+"/config", "-s", tmp+"/f2b.sock", "start",))
-			self.assertLogged("Fail2ban seems to be in unexpected state (not running but the socket exists)")
-			self.pruneLog()
-			os.remove(tmp+"/f2b.sock")
+		## already exists:
+		open(tmp+"/f2b.sock", 'a').close()
+		self.assertRaises(FailExitException, _exec_client,
+			(CLIENT, "--async", "-c", tmp+"/config", "-s", tmp+"/f2b.sock", "start",))
+		self.assertLogged("Fail2ban seems to be in unexpected state (not running but the socket exists)")
+		self.pruneLog()
+		os.remove(tmp+"/f2b.sock")
 
-			## wrong option:
-			self.assertRaises(FailExitException, _exec_client, 
-				(CLIENT, "-s",))
-			self.assertLogged("Usage: ")
-			self.pruneLog()
-
-		finally:
-			_kill_srv(tmp)
+		## wrong option:
+		self.assertRaises(FailExitException, _exec_client,
+			(CLIENT, "-s",))
+		self.assertLogged("Usage: ")
+		self.pruneLog()
 
 	def testVisualWait(self):
 		sleeptime = 0.035
@@ -485,34 +438,32 @@ class Fail2banServerTest(Fail2banClientServerBase):
 		self.assertLogged("Report bugs to ")
 
 	@with_tmpdir
+	@with_kill_srv
 	def testServerStartBackground(self, tmp):
+		# to prevent fork of test-cases process, start server in background via command:
+		startparams = _start_params(tmp, logtarget=tmp+"/f2b.log")
+		# start (in new process, using the same python version):
+		cmd = (sys.executable, os.path.join(os.path.join(BIN), SERVER))
+		logSys.debug('Start %s ...', cmd)
+		cmd = cmd + startparams + ("-b",)
+		ret = Utils.executeCmd(cmd, timeout=MAX_WAITTIME, shell=False, output=True)
+		self.assertTrue(len(ret) and ret[0])
+		# wait for server (socket and ready):
+		self._wait_for_srv(tmp, True, startparams=cmd)
+		self.assertLogged("Server ready")
+		self.pruneLog()
 		try:
-			# to prevent fork of test-cases process, start server in background via command:
-			startparams = _start_params(tmp, logtarget=tmp+"/f2b.log")
-			# start (in new process, using the same python version):
-			cmd = (sys.executable, os.path.join(os.path.join(BIN), SERVER))
-			logSys.debug('Start %s ...', cmd)
-			cmd = cmd + startparams + ("-b",)
-			ret = Utils.executeCmd(cmd, timeout=MAX_WAITTIME, shell=False, output=True)
-			self.assertTrue(len(ret) and ret[0])
-			# wait for server (socket and ready):
-			self._wait_for_srv(tmp, True, startparams=cmd)
-			self.assertLogged("Server ready")
-			self.pruneLog()
-			try:
-				self.assertRaises(ExitException, _exec_server, 
-					(SERVER,) + startparams + ("echo", "TEST-ECHO",))
-				self.assertRaises(FailExitException, _exec_server, 
-					(SERVER,) + startparams + ("~~unknown~cmd~failed~~",))
-			finally:
-				self.pruneLog()
-				# stop:
-				self.assertRaises(ExitException, _exec_server, 
-					(SERVER,) + startparams + ("stop",))
-				self.assertLogged("Shutdown successful")
-				self.assertLogged("Exit with code 0")
+			self.assertRaises(ExitException, _exec_server,
+				(SERVER,) + startparams + ("echo", "TEST-ECHO",))
+			self.assertRaises(FailExitException, _exec_server,
+				(SERVER,) + startparams + ("~~unknown~cmd~failed~~",))
 		finally:
-			_kill_srv(tmp)
+			self.pruneLog()
+			# stop:
+			self.assertRaises(ExitException, _exec_server,
+				(SERVER,) + startparams + ("stop",))
+			self.assertLogged("Shutdown successful")
+			self.assertLogged("Exit with code 0")
 
 	def _testServerStartForeground(self, tmp, startparams, phase):
 		# start and wait to end (foreground):
@@ -560,35 +511,32 @@ class Fail2banServerTest(Fail2banClientServerBase):
 				self.assertTrue(phase.get('end', None))
 				self.assertLogged("Shutdown successful", "Exiting Fail2ban")
 		finally:
-			_kill_srv(tmp)
+			kill_srv(tmp)
 			if th:
 				th.join()
 
 	@with_tmpdir
+	@with_kill_srv
 	def testServerFailStart(self, tmp):
-		try:
-			# started directly here, so prevent overwrite test cases logger with "INHERITED"
-			startparams = _start_params(tmp, logtarget="INHERITED")
+		# started directly here, so prevent overwrite test cases logger with "INHERITED"
+		startparams = _start_params(tmp, logtarget="INHERITED")
 
-			## wrong config directory
-			self.assertRaises(FailExitException, _exec_server, 
-				(SERVER, "-c", tmp+"/miss",))
-			self.assertLogged("Base configuration directory " + tmp+"/miss" + " does not exist")
-			self.pruneLog()
+		## wrong config directory
+		self.assertRaises(FailExitException, _exec_server,
+			(SERVER, "-c", tmp+"/miss",))
+		self.assertLogged("Base configuration directory " + tmp+"/miss" + " does not exist")
+		self.pruneLog()
 
-			## wrong socket
-			self.assertRaises(FailExitException, _exec_server, 
-				(SERVER, "-c", tmp+"/config", "-x", "-s", tmp+"/miss/f2b.sock",))
-			self.assertLogged("There is no directory " + tmp+"/miss" + " to contain the socket file")
-			self.pruneLog()
+		## wrong socket
+		self.assertRaises(FailExitException, _exec_server,
+			(SERVER, "-c", tmp+"/config", "-x", "-s", tmp+"/miss/f2b.sock",))
+		self.assertLogged("There is no directory " + tmp+"/miss" + " to contain the socket file")
+		self.pruneLog()
 
-			## already exists:
-			open(tmp+"/f2b.sock", 'a').close()
-			self.assertRaises(FailExitException, _exec_server, 
-				(SERVER, "-c", tmp+"/config", "-s", tmp+"/f2b.sock",))
-			self.assertLogged("Fail2ban seems to be in unexpected state (not running but the socket exists)")
-			self.pruneLog()
-			os.remove(tmp+"/f2b.sock")
-
-		finally:
-			_kill_srv(tmp)
+		## already exists:
+		open(tmp+"/f2b.sock", 'a').close()
+		self.assertRaises(FailExitException, _exec_server,
+			(SERVER, "-c", tmp+"/config", "-s", tmp+"/f2b.sock",))
+		self.assertLogged("Fail2ban seems to be in unexpected state (not running but the socket exists)")
+		self.pruneLog()
+		os.remove(tmp+"/f2b.sock")
