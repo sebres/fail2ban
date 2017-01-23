@@ -19,6 +19,7 @@ config/action.d/firewallcmd-multiport.conf
 config/action.d/firewallcmd-new.conf
 config/action.d/firewallcmd-rich-logging.conf
 config/action.d/firewallcmd-rich-rules.conf
+config/action.d/helpers-common.conf
 config/action.d/hostsdeny.conf
 config/action.d/ipfilter.conf
 config/action.d/ipfw.conf
@@ -38,6 +39,7 @@ config/action.d/mail-whois-common.conf
 config/action.d/mail-whois.conf
 config/action.d/mail-whois-lines.conf
 config/action.d/mynetwatchman.conf
+config/action.d/netscaler.conf
 config/action.d/nftables-allports.conf
 config/action.d/nftables-common.conf
 config/action.d/nftables-multiport.conf
@@ -84,6 +86,7 @@ config/filter.d/courier-auth.conf
 config/filter.d/courier-smtp.conf
 config/filter.d/cyrus-imap.conf
 config/filter.d/directadmin.conf
+config/filter.d/domino-smtp.conf
 config/filter.d/dovecot.conf
 config/filter.d/dropbear.conf
 config/filter.d/drupal-auth.conf
@@ -137,6 +140,7 @@ config/filter.d/sogo-auth.conf
 config/filter.d/solid-pop3d.conf
 config/filter.d/squid.conf
 config/filter.d/squirrelmail.conf
+config/filter.d/sshd-aggressive.conf
 config/filter.d/sshd.conf
 config/filter.d/sshd-ddos.conf
 config/filter.d/stunnel.conf
@@ -217,7 +221,6 @@ fail2ban/tests/clientbeautifiertestcase.py
 fail2ban/tests/clientreadertestcase.py
 fail2ban/tests/config/action.d/brokenaction.conf
 fail2ban/tests/config/fail2ban.conf
-fail2ban/tests/config/filter.d/common.conf
 fail2ban/tests/config/filter.d/simple.conf
 fail2ban/tests/config/filter.d/test.conf
 fail2ban/tests/config/filter.d/test.local
@@ -278,6 +281,7 @@ fail2ban/tests/files/logs/courier-auth
 fail2ban/tests/files/logs/courier-smtp
 fail2ban/tests/files/logs/cyrus-imap
 fail2ban/tests/files/logs/directadmin
+fail2ban/tests/files/logs/domino-smtp
 fail2ban/tests/files/logs/dovecot
 fail2ban/tests/files/logs/dropbear
 fail2ban/tests/files/logs/drupal-auth
@@ -329,6 +333,7 @@ fail2ban/tests/files/logs/solid-pop3d
 fail2ban/tests/files/logs/squid
 fail2ban/tests/files/logs/squirrelmail
 fail2ban/tests/files/logs/sshd
+fail2ban/tests/files/logs/sshd-aggressive
 fail2ban/tests/files/logs/sshd-ddos
 fail2ban/tests/files/logs/stunnel
 fail2ban/tests/files/logs/suhosin
@@ -339,6 +344,7 @@ fail2ban/tests/files/logs/webmin-auth
 fail2ban/tests/files/logs/wuftpd
 fail2ban/tests/files/logs/xinetd-fail
 fail2ban/tests/files/logs/zzz-generic-example
+fail2ban/tests/files/testcase01a.log
 fail2ban/tests/files/testcase01.log
 fail2ban/tests/files/testcase02.log
 fail2ban/tests/files/testcase03.log
