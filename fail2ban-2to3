@@ -6,6 +6,11 @@
 set -eu
 
 if 2to3 -w --no-diffs bin/* fail2ban;then
+  # replace interpreter to current python3 version:
+  for fn in $(grep -lRE -m 1 '^\#\s*\!' bin/)
+  do
+    sed -i -r '1 s/^(\#\!\/usr\/bin\/env )python$/\1python3/' $fn
+  done
   echo "Success!" >&2
   exit 0
 else
