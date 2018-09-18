@@ -29,10 +29,11 @@ import tempfile
 import time
 import unittest
 
-from ..server.action import CommandAction, CallingMap
-from ..server.actions import OrderedDict
+from ..server.action import CommandAction, CallingMap, substituteRecursiveTags
+from ..server.actions import OrderedDict, Actions
 from ..server.utils import Utils
 
+from .dummyjail import DummyJail
 from .utils import LogCaptureTestCase
 from .utils import pid_exists
 
@@ -40,12 +41,20 @@ class CommandActionTest(LogCaptureTestCase):
 
 	def setUp(self):
 		"""Call before every test case."""
-		self.__action = CommandAction(None, "Test")
 		LogCaptureTestCase.setUp(self)
+		self.__action = CommandAction(None, "Test")
+		# prevent execute stop if start fails (or event not started at all):
+		self.__action_started = False
+		orgstart = self.__action.start
+		def _action_start():
+			self.__action_started = True
+			return orgstart()
+		self.__action.start = _action_start
 
 	def tearDown(self):
 		"""Call after every test case."""
-		self.__action.stop()
+		if self.__action_started:
+			self.__action.stop()
 		LogCaptureTestCase.tearDown(self)
 
 	def testSubstituteRecursiveTags(self):
@@ -56,30 +65,30 @@ class CommandActionTest(LogCaptureTestCase):
 		}
 		# Recursion is bad
 		self.assertRaises(ValueError,
-			lambda: CommandAction.substituteRecursiveTags({'A': '<A>'}))
+			lambda: substituteRecursiveTags({'A': '<A>'}))
 		self.assertRaises(ValueError,
-			lambda: CommandAction.substituteRecursiveTags({'A': '<B>', 'B': '<A>'}))
+			lambda: substituteRecursiveTags({'A': '<B>', 'B': '<A>'}))
 		self.assertRaises(ValueError,
-			lambda: CommandAction.substituteRecursiveTags({'A': '<B>', 'B': '<C>', 'C': '<A>'}))
+			lambda: substituteRecursiveTags({'A': '<B>', 'B': '<C>', 'C': '<A>'}))
 		# Unresolveable substition
 		self.assertRaises(ValueError,
-			lambda: CommandAction.substituteRecursiveTags({'A': 'to=<B> fromip=<IP>', 'C': '<B>', 'B': '<C>', 'D': ''}))
+			lambda: substituteRecursiveTags({'A': 'to=<B> fromip=<IP>', 'C': '<B>', 'B': '<C>', 'D': ''}))
 		self.assertRaises(ValueError,
-			lambda: CommandAction.substituteRecursiveTags({'failregex': 'to=<honeypot> fromip=<IP>', 'sweet': '<honeypot>', 'honeypot': '<sweet>', 'ignoreregex': ''}))
+			lambda: substituteRecursiveTags({'failregex': 'to=<honeypot> fromip=<IP>', 'sweet': '<honeypot>', 'honeypot': '<sweet>', 'ignoreregex': ''}))
 		# We need here an ordered, because the sequence of iteration is very important for this test
 		if OrderedDict:
 			# No cyclic recursion, just multiple replacement of tag <T>, should be successful:
-			self.assertEqual(CommandAction.substituteRecursiveTags( OrderedDict(
+			self.assertEqual(substituteRecursiveTags( OrderedDict(
 					(('X', 'x=x<T>'), ('T', '1'), ('Z', '<X> <T> <Y>'), ('Y', 'y=y<T>')))
 				), {'X': 'x=x1', 'T': '1', 'Y': 'y=y1', 'Z': 'x=x1 1 y=y1'}
 			)
 			# No cyclic recursion, just multiple replacement of tag <T> in composite tags, should be successful:
-			self.assertEqual(CommandAction.substituteRecursiveTags( OrderedDict(
+			self.assertEqual(substituteRecursiveTags( OrderedDict(
 				  (('X', 'x=x<T> <Z> <<R1>> <<R2>>'), ('R1', 'Z'), ('R2', 'Y'), ('T', '1'), ('Z', '<T> <Y>'), ('Y', 'y=y<T>')))
 				), {'X': 'x=x1 1 y=y1 1 y=y1 y=y1', 'R1': 'Z', 'R2': 'Y', 'T': '1', 'Z': '1 y=y1', 'Y': 'y=y1'}
 			)
 			# No cyclic recursion, just multiple replacement of same tags, should be successful:
-			self.assertEqual(CommandAction.substituteRecursiveTags( OrderedDict((
+			self.assertEqual(substituteRecursiveTags( OrderedDict((
 					('actionstart', 'ipset create <ipmset> hash:ip timeout <bantime> family <ipsetfamily>\n<iptables> -I <chain> <actiontype>'),
 					('ipmset', 'f2b-<name>'),
 					('name', 'any'),
@@ -111,43 +120,74 @@ class CommandActionTest(LogCaptureTestCase):
 				))
 			)
 			# Cyclic recursion by composite tag creation, tags "create" another tag, that closes cycle:
-			self.assertRaises(ValueError, lambda: CommandAction.substituteRecursiveTags( OrderedDict((
+			self.assertRaises(ValueError, lambda: substituteRecursiveTags( OrderedDict((
 					('A', '<<B><C>>'),
 					('B', 'D'), ('C', 'E'),
 					('DE', 'cycle <A>'),
 			)) ))
-			self.assertRaises(ValueError, lambda: CommandAction.substituteRecursiveTags( OrderedDict((
+			self.assertRaises(ValueError, lambda: substituteRecursiveTags( OrderedDict((
 					('DE', 'cycle <A>'),
 					('A', '<<B><C>>'),
 					('B', 'D'), ('C', 'E'),
 			)) ))
 			
 		# missing tags are ok
-		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<C>'}), {'A': '<C>'})
-		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<C> <D> <X>','X':'fun'}), {'A': '<C> <D> fun', 'X':'fun'})
-		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<C> <B>', 'B': 'cool'}), {'A': '<C> cool', 'B': 'cool'})
+		self.assertEqual(substituteRecursiveTags({'A': '<C>'}), {'A': '<C>'})
+		self.assertEqual(substituteRecursiveTags({'A': '<C> <D> <X>','X':'fun'}), {'A': '<C> <D> fun', 'X':'fun'})
+		self.assertEqual(substituteRecursiveTags({'A': '<C> <B>', 'B': 'cool'}), {'A': '<C> cool', 'B': 'cool'})
 		# Escaped tags should be ignored
-		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<matches> <B>', 'B': 'cool'}), {'A': '<matches> cool', 'B': 'cool'})
+		self.assertEqual(substituteRecursiveTags({'A': '<matches> <B>', 'B': 'cool'}), {'A': '<matches> cool', 'B': 'cool'})
 		# Multiple stuff on same line is ok
-		self.assertEqual(CommandAction.substituteRecursiveTags({'failregex': 'to=<honeypot> fromip=<IP> evilperson=<honeypot>', 'honeypot': 'pokie', 'ignoreregex': ''}),
+		self.assertEqual(substituteRecursiveTags({'failregex': 'to=<honeypot> fromip=<IP> evilperson=<honeypot>', 'honeypot': 'pokie', 'ignoreregex': ''}),
 								{ 'failregex': "to=pokie fromip=<IP> evilperson=pokie",
 									'honeypot': 'pokie',
 									'ignoreregex': '',
 								})
 		# rest is just cool
-		self.assertEqual(CommandAction.substituteRecursiveTags(aInfo),
+		self.assertEqual(substituteRecursiveTags(aInfo),
 								{ 'HOST': "192.0.2.0",
 									'ABC': '123 192.0.2.0',
 									'xyz': '890 123 192.0.2.0',
 								})
 		# obscure embedded case
-		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<<PREF>HOST>', 'PREF': 'IPV4'}),
+		self.assertEqual(substituteRecursiveTags({'A': '<<PREF>HOST>', 'PREF': 'IPV4'}),
 						 {'A': '<IPV4HOST>', 'PREF': 'IPV4'})
-		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<<PREF>HOST>', 'PREF': 'IPV4', 'IPV4HOST': '1.2.3.4'}),
+		self.assertEqual(substituteRecursiveTags({'A': '<<PREF>HOST>', 'PREF': 'IPV4', 'IPV4HOST': '1.2.3.4'}),
 						 {'A': '1.2.3.4', 'PREF': 'IPV4', 'IPV4HOST': '1.2.3.4'})
 		# more embedded within a string and two interpolations
-		self.assertEqual(CommandAction.substituteRecursiveTags({'A': 'A <IP<PREF>HOST> B IP<PREF> C', 'PREF': 'V4', 'IPV4HOST': '1.2.3.4'}),
+		self.assertEqual(substituteRecursiveTags({'A': 'A <IP<PREF>HOST> B IP<PREF> C', 'PREF': 'V4', 'IPV4HOST': '1.2.3.4'}),
 						 {'A': 'A 1.2.3.4 B IPV4 C', 'PREF': 'V4', 'IPV4HOST': '1.2.3.4'})
+
+	def testSubstRec_DontTouchUnusedCallable(self):
+		cm = CallingMap({
+			'A':0,
+			'B':lambda self: '<A><A>',
+			'C':'',
+			'D':''
+		})
+		#
+		# should raise no exceptions:
+		substituteRecursiveTags(cm)
+		# add exception tag:
+		cm['C'] = lambda self,i=0: 5 // int(self['A']) # raise error by access
+		# test direct get of callable (should raise an error):
+		self.assertRaises(ZeroDivisionError, lambda: cm['C'])
+		# should raise no exceptions (tag "C" still unused):
+		substituteRecursiveTags(cm)
+		# add reference to "broken" tag:
+		cm['D'] = 'test=<C>'
+		# should raise an exception (BOOM by replacement of tag "D" recursive):
+		self.assertRaises(ZeroDivisionError, lambda: substituteRecursiveTags(cm))
+		#
+		# should raise no exceptions:
+		self.assertEqual(self.__action.replaceTag('test=<A>', cm), "test=0")
+		# **Important**: recursive replacement of dynamic data from calling map should be prohibited,
+		# otherwise may be vulnerable on foreign user-input:
+		self.assertEqual(self.__action.replaceTag('test=<A>--<B>--<A>', cm), "test=0--<A><A>--0")
+		# should raise an exception (BOOM by replacement of tag "C"):
+		self.assertRaises(ZeroDivisionError, lambda: self.__action.replaceTag('test=<C>', cm))
+		# should raise no exceptions (replaces tag "D" only):
+		self.assertEqual(self.__action.replaceTag('<D>', cm), "test=<C>")
 
 	def testReplaceTag(self):
 		aInfo = {
@@ -167,15 +207,15 @@ class CommandActionTest(LogCaptureTestCase):
 		self.assertEqual(
 			self.__action.replaceTag("<matches>",
 				{'matches': "some >char< should \< be[ escap}ed&\n"}),
-			"some \\>char\\< should \\\\\\< be\\[ escap\\}ed\\&\n")
+			"some \\>char\\< should \\\\\\< be\\[ escap\\}ed\\&\\n")
 		self.assertEqual(
 			self.__action.replaceTag("<ipmatches>",
 				{'ipmatches': "some >char< should \< be[ escap}ed&\n"}),
-			"some \\>char\\< should \\\\\\< be\\[ escap\\}ed\\&\n")
+			"some \\>char\\< should \\\\\\< be\\[ escap\\}ed\\&\\n")
 		self.assertEqual(
 			self.__action.replaceTag("<ipjailmatches>",
-				{'ipjailmatches': "some >char< should \< be[ escap}ed&\n"}),
-			"some \\>char\\< should \\\\\\< be\\[ escap\\}ed\\&\n")
+				{'ipjailmatches': "some >char< should \< be[ escap}ed&\r\n"}),
+			"some \\>char\\< should \\\\\\< be\\[ escap\\}ed\\&\\r\\n")
 
 		# Recursive
 		aInfo["ABC"] = "<xyz>"
@@ -186,7 +226,7 @@ class CommandActionTest(LogCaptureTestCase):
 		# Callable
 		self.assertEqual(
 			self.__action.replaceTag("09 <matches> 11",
-				CallingMap(matches=lambda: str(10))),
+				CallingMap(matches=lambda self: str(10))),
 			"09 10 11")
 
 	def testReplaceNoTag(self):
@@ -194,7 +234,27 @@ class CommandActionTest(LogCaptureTestCase):
 		# Will raise ValueError if it is
 		self.assertEqual(
 			self.__action.replaceTag("abc",
-				CallingMap(matches=lambda: int("a"))), "abc")
+				CallingMap(matches=lambda self: int("a"))), "abc")
+
+	def testReplaceTagSelfRecursion(self):
+		setattr(self.__action, 'a', "<a")
+		setattr(self.__action, 'b', "c>")
+		setattr(self.__action, 'b?family=inet6', "b>")
+		setattr(self.__action, 'ac', "<a><b>")
+		setattr(self.__action, 'ab', "<ac>")
+		setattr(self.__action, 'x?family=inet6', "")
+		# produce self-referencing properties except:
+		self.assertRaisesRegexp(ValueError, r"properties contain self referencing definitions",
+			lambda: self.__action.replaceTag("<a><b>", 
+				self.__action._properties, conditional="family=inet4")
+		)
+		# remore self-referencing in props:
+		delattr(self.__action, 'ac')
+		# produce self-referencing query except:
+		self.assertRaisesRegexp(ValueError, r"possible self referencing definitions in query",
+			lambda: self.__action.replaceTag("<x<x<x<x<x<x<x<x<x<x<x<x<x<x<x<x<x<x<x<x<x>>>>>>>>>>>>>>>>>>>>>", 
+				self.__action._properties, conditional="family=inet6")
+		)
 
 	def testReplaceTagConditionalCached(self):
 		setattr(self.__action, 'abc', "123")
@@ -217,10 +277,10 @@ class CommandActionTest(LogCaptureTestCase):
 				self.__action.replaceTag("<banaction> '<abc>'", self.__action._properties, 
 					conditional="family=inet6", cache=cache),
 				"Text 890-567 text 567 '567'")
-		self.assertEqual(len(cache) if cache is not None else -1, 3)
+		self.assertTrue(len(cache) >= 3)
 		# set one parameter - internal properties and cache should be reseted:
 		setattr(self.__action, 'xyz', "000-<abc>")
-		self.assertEqual(len(cache) if cache is not None else -1, 0)
+		self.assertEqual(len(cache), 0)
 		# test againg, should have 000 instead of 890:
 		for i in range(2):
 			self.assertEqual(
@@ -235,7 +295,7 @@ class CommandActionTest(LogCaptureTestCase):
 				self.__action.replaceTag("<banaction> '<abc>'", self.__action._properties, 
 					conditional="family=inet6", cache=cache),
 				"Text 000-567 text 567 '567'")
-		self.assertEqual(len(cache), 3)
+		self.assertTrue(len(cache) >= 3)
 
 
 	def testExecuteActionBan(self):
@@ -275,7 +335,34 @@ class CommandActionTest(LogCaptureTestCase):
 		self.__action.actionban = "rm /tmp/fail2ban.test"
 		self.__action.actioncheck = "[ -e /tmp/fail2ban.test ]"
 		self.assertRaises(RuntimeError, self.__action.ban, {'ip': None})
-		self.assertLogged('Unable to restore environment')
+		self.assertLogged('Invariant check failed', 'Unable to restore environment', all=True)
+		# 2nd time, try to restore with producing error in stop, but succeeded start hereafter:
+		self.pruneLog('[phase 2]')
+		self.__action.actionstart = "touch /tmp/fail2ban.test"
+		self.__action.actionstop = "rm /tmp/fail2ban.test"
+		self.__action.actionban = 'printf "%%b\n" <ip> >> /tmp/fail2ban.test'
+		self.__action.actioncheck = "[ -e /tmp/fail2ban.test ]"
+		self.__action.ban({'ip': None})
+		self.assertLogged('Invariant check failed')
+		self.assertNotLogged('Unable to restore environment')
+
+	def testExecuteActionCheckRepairEnvironment(self):
+		self.__action.actionstart = ""
+		self.__action.actionstop = ""
+		self.__action.actionban = "rm /tmp/fail2ban.test"
+		self.__action.actioncheck = "[ -e /tmp/fail2ban.test ]"
+		self.__action.actionrepair = "echo 'repair ...'; touch /tmp/fail2ban.test"
+		# 1st time with success repair:
+		self.__action.ban({'ip': None})
+		self.assertLogged("Invariant check failed. Trying", "echo 'repair ...'", all=True)
+		self.pruneLog()
+		# 2nd time failed (not really repaired):
+		self.__action.actionrepair = "echo 'repair ...'"
+		self.assertRaises(RuntimeError, self.__action.ban, {'ip': None})
+		self.assertLogged(
+			"Invariant check failed. Trying", 
+			"echo 'repair ...'", 
+			"Unable to restore environment", all=True)
 
 	def testExecuteActionChangeCtags(self):
 		self.assertRaises(AttributeError, getattr, self.__action, "ROST")
@@ -283,35 +370,94 @@ class CommandActionTest(LogCaptureTestCase):
 		self.assertEqual(self.__action.ROST,"192.0.2.0")
 
 	def testExecuteActionUnbanAinfo(self):
-		aInfo = {
+		aInfo = CallingMap({
 			'ABC': "123",
-		}
-		self.__action.actionban = "touch /tmp/fail2ban.test.123"
-		self.__action.actionunban = "rm /tmp/fail2ban.test.<ABC>"
+			'ip': '192.0.2.1',
+			'F-*': lambda self: {
+		  	'fid': 111,
+		  	'fport': 222,
+				'user': "tester"
+			}
+		})
+		self.__action.actionban = "touch /tmp/fail2ban.test.123; echo 'failure <F-ID> of <F-USER> -<F-TEST>- from <ip>:<F-PORT>'"
+		self.__action.actionunban = "rm /tmp/fail2ban.test.<ABC>; echo 'user <F-USER> unbanned'"
 		self.__action.ban(aInfo)
 		self.__action.unban(aInfo)
+		self.assertLogged(
+			" -- stdout: 'failure 111 of tester -- from 192.0.2.1:222'",
+			" -- stdout: 'user tester unbanned'",
+			all=True
+		)
 
 	def testExecuteActionStartEmpty(self):
 		self.__action.actionstart = ""
 		self.__action.start()
+		self.assertTrue(self.__action.executeCmd(""))
 		self.assertLogged('Nothing to do')
+		self.pruneLog()
+		self.assertTrue(self.__action._processCmd(""))
+		self.assertLogged('Nothing to do')
+		self.pruneLog()
+
+	def testExecuteWithVars(self):
+		self.assertTrue(self.__action.executeCmd(
+			r'''printf %b "foreign input:\n'''
+			r''' -- $f2bV_A --\n'''
+			r''' -- $f2bV_B --\n'''
+			r''' -- $(echo -n $f2bV_C) --''' # echo just replaces \n to test it as single line
+			r'''"''', 
+			varsDict={
+			'f2bV_A': 'I\'m a hacker; && $(echo $f2bV_B)', 
+			'f2bV_B': 'I"m very bad hacker', 
+			'f2bV_C': '`Very | very\n$(bad & worst hacker)`'
+		}))
+		self.assertLogged(r"""foreign input:""",
+			' -- I\'m a hacker; && $(echo $f2bV_B) --',
+			' -- I"m very bad hacker --',
+			' -- `Very | very $(bad & worst hacker)` --', all=True)
+
+	def testExecuteReplaceEscapeWithVars(self):
+		self.__action.actionban = 'echo "** ban <ip>, reason: <reason> ...\\n<matches>"'
+		self.__action.actionunban = 'echo "** unban <ip>"'
+		self.__action.actionstop = 'echo "** stop monitoring"'
+		matches = [
+			'<actionunban>',
+			'" Hooray! #',
+			'`I\'m cool script kiddy',
+			'`I`m very cool > /here-is-the-path/to/bin/.x-attempt.sh',
+			'<actionstop>',
+		]
+		aInfo = {
+			'ip': '192.0.2.1',
+			'reason': 'hacking attempt ( he thought he knows how f2b internally works ;)',
+			'matches': '\n'.join(matches)
+		}
+		self.pruneLog()
+		self.__action.ban(aInfo)
+		self.assertLogged(
+			'** ban %s' % aInfo['ip'], aInfo['reason'], *matches, all=True)
+		self.assertNotLogged(
+			'** unban %s' % aInfo['ip'], '** stop monitoring', all=True)
+		self.pruneLog()
+		self.__action.unban(aInfo)
+		self.__action.stop()
+		self.assertLogged(
+			'** unban %s' % aInfo['ip'], '** stop monitoring', all=True)
 
 	def testExecuteIncorrectCmd(self):
 		CommandAction.executeCmd('/bin/ls >/dev/null\nbogusXXX now 2>/dev/null')
 		self.assertLogged('HINT on 127: "Command not found"')
 
 	def testExecuteTimeout(self):
-		unittest.F2B.SkipIfFast()
 		stime = time.time()
-		# Should take a minute
-		self.assertFalse(CommandAction.executeCmd('sleep 30', timeout=1))
+		timeout = 1 if not unittest.F2B.fast else 0.01
+		# Should take a 30 seconds (so timeout will occur)
+		self.assertFalse(CommandAction.executeCmd('sleep 30', timeout=timeout))
 		# give a test still 1 second, because system could be too busy
-		self.assertTrue(time.time() >= stime + 1 and time.time() <= stime + 2)
-		self.assertLogged(
-			'sleep 30 -- timed out after 1 seconds',
-			'sleep 30 -- timed out after 2 seconds'
-		)
-		self.assertLogged('sleep 30 -- killed with SIGTERM')
+		self.assertTrue(time.time() >= stime + timeout and time.time() <= stime + timeout + 1)
+		self.assertLogged('sleep 30', ' -- timed out after', all=True)
+		self.assertLogged(' -- killed with SIGTERM', 
+		                  ' -- killed with SIGKILL')
 
 	def testExecuteTimeoutWithNastyChildren(self):
 		# temporary file for a nasty kid shell script
@@ -330,8 +476,8 @@ class CommandActionTest(LogCaptureTestCase):
 		# timeout as long as pid-file was not created, but max 5 seconds
 		def getnasty_tout():
 			return (
-				getnastypid() is None
-				and time.time() - stime <= 5
+				getnastypid() is not None
+				or time.time() - stime > 5
 			)
 
 		def getnastypid():
@@ -367,23 +513,23 @@ class CommandActionTest(LogCaptureTestCase):
 		# Verify that the process itself got killed
 		self.assertTrue(Utils.wait_for(lambda: not pid_exists(cpid), 3))
 		self.assertLogged('my pid ', 'Resource temporarily unavailable')
-		self.assertLogged('timed out')
-		self.assertLogged('killed with SIGTERM', 
-		                  'killed with SIGKILL')
+		self.assertLogged(' -- timed out')
+		self.assertLogged(' -- killed with SIGTERM', 
+		                  ' -- killed with SIGKILL')
 		os.unlink(tmpFilename)
 		os.unlink(tmpFilename + '.pid')
 
 
 	def testCaptureStdOutErr(self):
 		CommandAction.executeCmd('echo "How now brown cow"')
-		self.assertLogged("stdout: 'How now brown cow'\n", "stdout: b'How now brown cow'\n")
+		self.assertLogged("stdout: 'How now brown cow'\n")
 		CommandAction.executeCmd(
 			'echo "The rain in Spain stays mainly in the plain" 1>&2')
 		self.assertLogged(
-			"stderr: 'The rain in Spain stays mainly in the plain'\n", "stderr: b'The rain in Spain stays mainly in the plain'\n")
+			"stderr: 'The rain in Spain stays mainly in the plain'\n")
 
 	def testCallingMap(self):
-		mymap = CallingMap(callme=lambda: str(10), error=lambda: int('a'),
+		mymap = CallingMap(callme=lambda self: str(10), error=lambda self: int('a'),
 			dontcallme= "string", number=17)
 
 		# Should work fine
@@ -392,3 +538,64 @@ class CommandActionTest(LogCaptureTestCase):
 			"10 okay string 17")
 		# Error will now trip, demonstrating delayed call
 		self.assertRaises(ValueError, lambda x: "%(error)i" % x, mymap)
+
+	def testCallingMapModify(self):
+		m = CallingMap({
+			'a': lambda self: 2 + 3,
+			'b': lambda self: self['a'] + 6,
+			'c': 'test',
+		})
+		# test reset (without modifications):
+		m.reset()
+		# do modifications:
+		m['a'] = 4
+		del m['c']
+		# test set and delete:
+		self.assertEqual(len(m), 2)
+		self.assertNotIn('c', m)
+		self.assertEqual((m['a'], m['b']), (4, 10))
+		# reset to original and test again:
+		m.reset()
+		s = repr(m)
+		self.assertEqual(len(m), 3)
+		self.assertIn('c', m)
+		self.assertEqual((m['a'], m['b'], m['c']), (5, 11, 'test'))
+
+	def testCallingMapRep(self):
+		m = CallingMap({
+			'a': lambda self: 2 + 3,
+			'b': lambda self: self['a'] + 6,
+			'c': ''
+		})
+		s = repr(m); # only stored values (no calculated)
+		self.assertNotIn("'a': ", s)
+		self.assertNotIn("'b': ", s)
+		self.assertIn("'c': ''", s)
+
+		s = m._asrepr(True) # all values (including calculated)
+		self.assertIn("'a': 5", s)
+		self.assertIn("'b': 11", s)
+		self.assertIn("'c': ''", s)
+		
+		m['c'] = lambda self: self['xxx'] + 7; # unresolvable
+		s = m._asrepr(True)
+		self.assertIn("'a': 5", s)
+		self.assertIn("'b': 11", s)
+		self.assertIn("'c': ", s) # presents as callable
+		self.assertNotIn("'c': ''", s) # but not empty
+
+	def testActionsIdleMode(self):
+		a = Actions(DummyJail())
+		a.sleeptime = 0.0001;   # don't need to wait long
+		# enter idle mode right now (start idle):
+		a.idle = True;
+		# start:
+		a.start()
+		# wait for enter/leave of idle mode:
+		self.assertLogged("Actions: enter idle mode", wait=10)
+		# leave idle mode:
+		a.idle = False
+		self.assertLogged("Actions: leave idle mode", wait=10)
+		# stop it:
+		a.active = False
+		a.join()

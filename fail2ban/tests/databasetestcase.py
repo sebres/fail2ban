@@ -32,13 +32,14 @@ import shutil
 from ..server.filter import FileContainer
 from ..server.mytime import MyTime
 from ..server.ticket import FailTicket
-from ..server.actions import Actions
+from ..server.actions import Actions, Utils
 from .dummyjail import DummyJail
 try:
-	from ..server.database import Fail2BanDb as Fail2BanDb
+	from ..server import database
+	Fail2BanDb = database.Fail2BanDb
 except ImportError: # pragma: no cover
 	Fail2BanDb = None
-from .utils import LogCaptureTestCase
+from .utils import LogCaptureTestCase, logSys as DefLogSys
 
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
 
@@ -55,16 +56,25 @@ class DatabaseTest(LogCaptureTestCase):
 	def setUp(self):
 		"""Call before every test case."""
 		super(DatabaseTest, self).setUp()
-		if Fail2BanDb is None and sys.version_info >= (2,7): # pragma: no cover
+		if Fail2BanDb is None: # pragma: no cover
 			raise unittest.SkipTest(
 				"Unable to import fail2ban database module as sqlite is not "
 				"available.")
-		elif Fail2BanDb is None:
-			return
 		self.dbFilename = None
 		if not unittest.F2B.memory_db:
 			_, self.dbFilename = tempfile.mkstemp(".db", "fail2ban_")
-		self.db = getFail2BanDb(self.dbFilename)
+		self._db = ':auto-create-in-memory:'
+
+	@property
+	def db(self):
+		if isinstance(self._db, basestring) and self._db == ':auto-create-in-memory:':
+			self._db = getFail2BanDb(self.dbFilename)
+		return self._db
+	@db.setter
+	def db(self, value):
+		if isinstance(self._db, Fail2BanDb): # pragma: no cover
+			self._db.close()
+		self._db = value
 
 	def tearDown(self):
 		"""Call after every test case."""
@@ -76,13 +86,11 @@ class DatabaseTest(LogCaptureTestCase):
 			os.remove(self.dbFilename)
 
 	def testGetFilename(self):
-		if Fail2BanDb is None or self.db.filename == ':memory:': # pragma: no cover
-			return
+		if self.db.filename == ':memory:': # pragma: no cover
+			raise unittest.SkipTest("in :memory: database")
 		self.assertEqual(self.dbFilename, self.db.filename)
 
 	def testPurgeAge(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.assertEqual(self.db.purgeage, 86400)
 		self.db.purgeage = '1y6mon15d5h30m'
 		self.assertEqual(self.db.purgeage, 48652200)
@@ -90,16 +98,14 @@ class DatabaseTest(LogCaptureTestCase):
 		self.assertEqual(self.db.purgeage, 48652200*2)
 
 	def testCreateInvalidPath(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.assertRaises(
 			sqlite3.OperationalError,
 			Fail2BanDb,
 			"/this/path/should/not/exist")
 
 	def testCreateAndReconnect(self):
-		if Fail2BanDb is None or self.db.filename == ':memory:': # pragma: no cover
-			return
+		if self.db.filename == ':memory:': # pragma: no cover
+			raise unittest.SkipTest("in :memory: database")
 		self.testAddJail()
 		# Reconnect...
 		self.db = Fail2BanDb(self.dbFilename)
@@ -108,27 +114,68 @@ class DatabaseTest(LogCaptureTestCase):
 			self.jail.name in self.db.getJailNames(),
 			"Jail not retained in Db after disconnect reconnect.")
 
-	def testUpdateDb(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
+	def testRepairDb(self):
+		if not Utils.executeCmd("sqlite3 --version"): # pragma: no cover
+			raise unittest.SkipTest("no sqlite3 command")
 		self.db = None
 		if self.dbFilename is None: # pragma: no cover
 			_, self.dbFilename = tempfile.mkstemp(".db", "fail2ban_")
-		shutil.copyfile(
-			os.path.join(TEST_FILES_DIR, 'database_v1.db'), self.dbFilename)
-		self.db = Fail2BanDb(self.dbFilename)
-		self.assertEqual(self.db.getJailNames(), set(['DummyJail #29162448 with 0 tickets']))
-		self.assertEqual(self.db.getLogPaths(), set(['/tmp/Fail2BanDb_pUlZJh.log']))
-		ticket = FailTicket("127.0.0.1", 1388009242.26, [u"abc\n"])
-		self.assertEqual(self.db.getBans()[0], ticket)
+		# test truncated database with different sizes:
+		#   - 14000 bytes - seems to be reparable,
+		#   - 4000  bytes - is totally broken.
+		for truncSize in (14000, 4000):
+			self.pruneLog("[test-repair], next phase - file-size: %d" % truncSize)
+			shutil.copyfile(
+				os.path.join(TEST_FILES_DIR, 'database_v1.db'), self.dbFilename)
+			# produce currupt database:
+			f = os.open(self.dbFilename, os.O_RDWR)
+			os.ftruncate(f, truncSize)
+			os.close(f)
+			# test repair:
+			try:
+				self.db = Fail2BanDb(self.dbFilename)
+				if truncSize == 14000: # restored:
+					self.assertLogged("Repair seems to be successful",
+						"Check integrity", "Database updated", all=True)
+					self.assertEqual(self.db.getLogPaths(), set(['/tmp/Fail2BanDb_pUlZJh.log']))
+					self.assertEqual(len(self.db.getJailNames()), 1)
+				else: # recreated:
+					self.assertLogged("Repair seems to be failed",
+						"Check integrity", "New database created.", all=True)
+					self.assertEqual(len(self.db.getLogPaths()), 0)
+					self.assertEqual(len(self.db.getJailNames()), 0)
+			finally:
+				if self.db and self.db._dbFilename != ":memory:":
+					os.remove(self.db._dbBackupFilename)
+					self.db = None
 
-		self.assertEqual(self.db.updateDb(Fail2BanDb.__version__), Fail2BanDb.__version__)
-		self.assertRaises(NotImplementedError, self.db.updateDb, Fail2BanDb.__version__ + 1)
-		os.remove(self.db._dbBackupFilename)
+	def testUpdateDb(self):
+		self.db = None
+		try:
+			if self.dbFilename is None: # pragma: no cover
+				_, self.dbFilename = tempfile.mkstemp(".db", "fail2ban_")
+			shutil.copyfile(
+				os.path.join(TEST_FILES_DIR, 'database_v1.db'), self.dbFilename)
+			self.db = Fail2BanDb(self.dbFilename)
+			self.assertEqual(self.db.getJailNames(), set(['DummyJail #29162448 with 0 tickets']))
+			self.assertEqual(self.db.getLogPaths(), set(['/tmp/Fail2BanDb_pUlZJh.log']))
+			ticket = FailTicket("127.0.0.1", 1388009242.26, [u"abc\n"])
+			self.assertEqual(self.db.getBans()[0], ticket)
+
+			self.assertEqual(self.db.updateDb(Fail2BanDb.__version__), Fail2BanDb.__version__)
+			self.assertRaises(NotImplementedError, self.db.updateDb, Fail2BanDb.__version__ + 1)
+			# check current bans (should find exactly 1 ticket after upgrade):
+			tickets = self.db.getCurrentBans(fromtime=1388009242, correctBanTime=123456)
+			self.assertEqual(len(tickets), 1)
+			self.assertEqual(tickets[0].getBanTime(), 123456); # ban-time was unknown (normally updated from jail)
+		finally:
+			if self.db and self.db._dbFilename != ":memory:":
+				os.remove(self.db._dbBackupFilename)
 
 	def testUpdateDb2(self):
-		if Fail2BanDb is None or self.db.filename == ':memory:': # pragma: no cover
-			return
+		self.db = None
+		if self.dbFilename is None: # pragma: no cover
+			_, self.dbFilename = tempfile.mkstemp(".db", "fail2ban_")
 		shutil.copyfile(
 			os.path.join(TEST_FILES_DIR, 'database_v2.db'), self.dbFilename)
 		self.db = Fail2BanDb(self.dbFilename)
@@ -148,14 +195,17 @@ class DatabaseTest(LogCaptureTestCase):
 		self.assertEqual(bans[1].getIP(), "1.2.3.8")
 		# updated ?
 		self.assertEqual(self.db.updateDb(Fail2BanDb.__version__), Fail2BanDb.__version__)
+		# check current bans (should find 2 tickets after upgrade):
+		self.jail = DummyJail(name='pam-generic')
+		tickets = self.db.getCurrentBans(jail=self.jail, fromtime=1417595494)
+		self.assertEqual(len(tickets), 2)
+		self.assertEqual(tickets[0].getBanTime(), 600)
 		# further update should fail:
 		self.assertRaises(NotImplementedError, self.db.updateDb, Fail2BanDb.__version__ + 1)
 		# clean:
 		os.remove(self.db._dbBackupFilename)
 
 	def testAddJail(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.jail = DummyJail()
 		self.db.addJail(self.jail)
 		self.assertTrue(
@@ -163,8 +213,6 @@ class DatabaseTest(LogCaptureTestCase):
 			"Jail not added to database")
 
 	def testAddLog(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.testAddJail() # Jail required
 
 		_, filename = tempfile.mkstemp(".log", "Fail2BanDb_")
@@ -172,12 +220,10 @@ class DatabaseTest(LogCaptureTestCase):
 
 		self.db.addLog(self.jail, self.fileContainer)
 
-		self.assertTrue(filename in self.db.getLogPaths(self.jail))
+		self.assertIn(filename, self.db.getLogPaths(self.jail))
 		os.remove(filename)
 
 	def testUpdateLog(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.testAddLog() # Add log file
 
 		# Write some text
@@ -217,56 +263,100 @@ class DatabaseTest(LogCaptureTestCase):
 		os.remove(filename)
 
 	def testAddBan(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.testAddJail()
 		ticket = FailTicket("127.0.0.1", 0, ["abc\n"])
 		self.db.addBan(self.jail, ticket)
 
-		self.assertEqual(len(self.db.getBans(jail=self.jail)), 1)
+		tickets = self.db.getBans(jail=self.jail)
+		self.assertEqual(len(tickets), 1)
 		self.assertTrue(
-			isinstance(self.db.getBans(jail=self.jail)[0], FailTicket))
+			isinstance(tickets[0], FailTicket))
 
 	def testAddBanInvalidEncoded(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.testAddJail()
 		# invalid + valid, invalid + valid unicode, invalid + valid dual converted (like in filter:readline by fallback) ...
 		tickets = [
-		  FailTicket("127.0.0.1", 0, ['user "\xd1\xe2\xe5\xf2\xe0"', 'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"']),
-		  FailTicket("127.0.0.2", 0, ['user "\xd1\xe2\xe5\xf2\xe0"', u'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"']),
-		  FailTicket("127.0.0.3", 0, ['user "\xd1\xe2\xe5\xf2\xe0"', b'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"'.decode('utf-8', 'replace')])
+		  FailTicket("127.0.0.1", 0, ['user "test"', 'user "\xd1\xe2\xe5\xf2\xe0"', 'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"']),
+		  FailTicket("127.0.0.2", 0, ['user "test"', u'user "\xd1\xe2\xe5\xf2\xe0"', u'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"']),
+		  FailTicket("127.0.0.3", 0, ['user "test"', b'user "\xd1\xe2\xe5\xf2\xe0"', b'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"']),
+		  FailTicket("127.0.0.4", 0, ['user "test"', 'user "\xd1\xe2\xe5\xf2\xe0"', u'user "\xe4\xf6\xfc\xdf"']),
+		  FailTicket("127.0.0.5", 0, ['user "test"', 'unterminated \xcf']),
+		  FailTicket("127.0.0.6", 0, ['user "test"', u'unterminated \xcf']),
+		  FailTicket("127.0.0.7", 0, ['user "test"', b'unterminated \xcf'])
 		]
-		self.db.addBan(self.jail, tickets[0])
-		self.db.addBan(self.jail, tickets[1])
-		self.db.addBan(self.jail, tickets[2])
+		for ticket in tickets:
+			self.db.addBan(self.jail, ticket)
+
+		self.assertNotLogged("json dumps failed")
 
 		readtickets = self.db.getBans(jail=self.jail)
-		self.assertEqual(len(readtickets), 3)
-		## python 2 or 3 :
-		invstr = u'user "\ufffd\ufffd\ufffd\ufffd\ufffd"'.encode('utf-8', 'replace')
-		self.assertTrue(
-			   readtickets[0] == FailTicket("127.0.0.1", 0, [invstr, 'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"'])
-			or readtickets[0] == tickets[0]
-		)
-		self.assertTrue(
-			   readtickets[1] == FailTicket("127.0.0.2", 0, [invstr, u'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"'.encode('utf-8', 'replace')])
-			or readtickets[1] == tickets[1]
-		)
-		self.assertTrue(
-			   readtickets[2] == FailTicket("127.0.0.3", 0, [invstr, 'user "\xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f"'])
-			or readtickets[2] == tickets[2]
-		)
+
+		self.assertNotLogged("json loads failed")
+
+		## all tickets available
+		self.assertEqual(len(readtickets), 7)
+
+		## too different to cover all possible constellations for python 2 and 3,
+		## can replace/ignore some non-ascii chars by json dump/load (unicode/str),
+		## so check ip and matches count only:
+		for i, ticket in enumerate(tickets):
+			DefLogSys.debug('readtickets[%d]: %r', i, readtickets[i].getData())
+			DefLogSys.debug(' == tickets[%d]: %r', i, ticket.getData())
+			self.assertEqual(readtickets[i].getIP(), ticket.getIP())
+			self.assertEqual(len(readtickets[i].getMatches()), len(ticket.getMatches()))
+
+		self.pruneLog('[test-phase 2] simulate errors')
+		## simulate errors in dumps/loads:
+		priorEnc = database.PREFER_ENC
+		try:
+			database.PREFER_ENC = 'f2b-test::non-existing-encoding'
+
+			for ticket in tickets:
+				self.db.addBan(self.jail, ticket)
+
+			self.assertLogged("json dumps failed")
+
+			readtickets = self.db.getBans(jail=self.jail)
+
+			self.assertLogged("json loads failed")
+
+			## despite errors all tickets written and loaded (check adapter-handlers are error-safe):
+			self.assertEqual(len(readtickets), 14)
+		finally:
+			database.PREFER_ENC = priorEnc
+		
+		## check the database is still operable (not locked) after all the errors:
+		self.pruneLog('[test-phase 3] still operable?')
+		self.db.addBan(self.jail, FailTicket("127.0.0.8"))
+		readtickets = self.db.getBans(jail=self.jail)
+		self.assertEqual(len(readtickets), 15)
+		self.assertNotLogged("json loads failed", "json dumps failed")
+
+	def _testAdd3Bans(self):
+		self.testAddJail()
+		for i in (1, 2, 3):
+			ticket = FailTicket(("192.0.2.%d" % i), 0, ["test\n"])
+			self.db.addBan(self.jail, ticket)
+		tickets = self.db.getBans(jail=self.jail)
+		self.assertEqual(len(tickets), 3)
+		return tickets
 
 	def testDelBan(self):
-		self.testAddBan()
-		ticket = self.db.getBans(jail=self.jail)[0]
-		self.db.delBan(self.jail, ticket.getIP())
+		tickets = self._testAdd3Bans()
+		# delete single IP:
+		self.db.delBan(self.jail, tickets[0].getIP())
+		self.assertEqual(len(self.db.getBans(jail=self.jail)), 2)
+		# delete two IPs:
+		self.db.delBan(self.jail, tickets[1].getIP(), tickets[2].getIP())
+		self.assertEqual(len(self.db.getBans(jail=self.jail)), 0)
+
+	def testFlushBans(self):
+		self._testAdd3Bans()
+		# flush all bans:
+		self.db.delBan(self.jail)
 		self.assertEqual(len(self.db.getBans(jail=self.jail)), 0)
 
 	def testGetBansWithTime(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.testAddJail()
 		self.db.addBan(
 			self.jail, FailTicket("127.0.0.1", MyTime.time() - 60, ["abc\n"]))
@@ -279,16 +369,20 @@ class DatabaseTest(LogCaptureTestCase):
 		self.assertEqual(len(self.db.getBans(jail=self.jail,bantime=-1)), 2)
 
 	def testGetBansMerged_MaxEntries(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.testAddJail()
 		maxEntries = 2
-		failures = ["abc\n", "123\n", "ABC\n", "1234\n"]
+		failures = [
+			{"matches": ["abc\n"], "user": set(['test'])},
+			{"matches": ["123\n"], "user": set(['test'])},
+			{"matches": ["ABC\n"], "user": set(['test', 'root'])},
+			{"matches": ["1234\n"], "user": set(['test', 'root'])},
+		]
+		matches2find = [f["matches"][0] for f in failures]
 		# add failures sequential:
 		i = 80
 		for f in failures:
 			i -= 10
-			ticket = FailTicket("127.0.0.1", MyTime.time() - i, [f])
+			ticket = FailTicket("127.0.0.1", MyTime.time() - i, data=f)
 			ticket.setAttempt(1)
 			self.db.addBan(self.jail, ticket)
 		# should retrieve 2 matches only, but count of all attempts:
@@ -297,9 +391,10 @@ class DatabaseTest(LogCaptureTestCase):
 		self.assertEqual(ticket.getIP(), "127.0.0.1")
 		self.assertEqual(ticket.getAttempt(), len(failures))
 		self.assertEqual(len(ticket.getMatches()), maxEntries)
-		self.assertEqual(ticket.getMatches(), failures[len(failures) - maxEntries:])
+		self.assertEqual(ticket.getMatches(), matches2find[-maxEntries:])
     # add more failures at once:
-		ticket = FailTicket("127.0.0.1", MyTime.time() - 10, failures)
+		ticket = FailTicket("127.0.0.1", MyTime.time() - 10, matches2find,
+			data={"user": set(['test', 'root'])})
 		ticket.setAttempt(len(failures))
 		self.db.addBan(self.jail, ticket)
 		# should retrieve 2 matches only, but count of all attempts:
@@ -307,14 +402,18 @@ class DatabaseTest(LogCaptureTestCase):
 		ticket = self.db.getBansMerged("127.0.0.1")
 		self.assertEqual(ticket.getAttempt(), 2 * len(failures))
 		self.assertEqual(len(ticket.getMatches()), maxEntries)
-		self.assertEqual(ticket.getMatches(), failures[len(failures) - maxEntries:])
+		self.assertEqual(ticket.getMatches(), matches2find[-maxEntries:])
+		# also using getCurrentBans:
+		ticket = self.db.getCurrentBans(self.jail, "127.0.0.1", fromtime=MyTime.time()-100)
+		self.assertTrue(ticket is not None)
+		self.assertEqual(ticket.getAttempt(), len(failures))
+		self.assertEqual(len(ticket.getMatches()), maxEntries)
+		self.assertEqual(ticket.getMatches(), matches2find[-maxEntries:])
 
 	def testGetBansMerged(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.testAddJail()
 
-		jail2 = DummyJail()
+		jail2 = DummyJail(name='DummyJail-2')
 		self.db.addJail(jail2)
 
 		ticket = FailTicket("127.0.0.1", MyTime.time() - 40, ["abc\n"])
@@ -365,9 +464,9 @@ class DatabaseTest(LogCaptureTestCase):
 
 		tickets = self.db.getBansMerged()
 		self.assertEqual(len(tickets), 2)
-		self.assertEqual(
-			sorted(list(set(ticket.getIP() for ticket in tickets))),
-			sorted([ticket.getIP() for ticket in tickets]))
+		self.assertSortedEqual(
+			list(set(ticket.getIP() for ticket in tickets)),
+			[ticket.getIP() for ticket in tickets])
 
 		tickets = self.db.getBansMerged(jail=jail2)
 		self.assertEqual(len(tickets), 1)
@@ -382,6 +481,39 @@ class DatabaseTest(LogCaptureTestCase):
 		# be returned
 		tickets = self.db.getBansMerged(bantime=-1)
 		self.assertEqual(len(tickets), 2)
+		# getCurrentBans:
+		tickets = self.db.getCurrentBans(jail=self.jail)
+		self.assertEqual(len(tickets), 2)
+		ticket = self.db.getCurrentBans(jail=None, ip="127.0.0.1");
+		self.assertEqual(ticket.getIP(), "127.0.0.1")
+		
+		# positive case (1 ticket not yet expired):
+		tickets = self.db.getCurrentBans(jail=self.jail, forbantime=15,
+			fromtime=MyTime.time())
+		self.assertEqual(len(tickets), 1)
+		# negative case (all are expired in 1year):
+		tickets = self.db.getCurrentBans(jail=self.jail, forbantime=15,
+			fromtime=MyTime.time() + MyTime.str2seconds("1year"))
+		self.assertEqual(len(tickets), 0)
+		# persistent bantime (-1), so never expired (but no persistent tickets):
+		tickets = self.db.getCurrentBans(jail=self.jail, forbantime=-1,
+			fromtime=MyTime.time() + MyTime.str2seconds("1year"))
+		self.assertEqual(len(tickets), 0)
+		# add persistent one:
+		ticket.setBanTime(-1)
+		self.db.addBan(self.jail, ticket)
+		# persistent bantime (-1), so never expired (but jail has other max bantime now):
+		tickets = self.db.getCurrentBans(jail=self.jail, forbantime=-1,
+			fromtime=MyTime.time() + MyTime.str2seconds("1year"))
+		# no tickets should be found (max ban time = 600):
+		self.assertEqual(len(tickets), 0)
+		self.assertLogged("ignore ticket (with new max ban-time %r)" % self.jail.getMaxBanTime())
+		# change jail to persistent ban and try again (1 persistent ticket):
+		self.jail.actions.setBanTime(-1)
+		tickets = self.db.getCurrentBans(jail=self.jail, forbantime=-1,
+			fromtime=MyTime.time() + MyTime.str2seconds("1year"))
+		self.assertEqual(len(tickets), 1)
+		self.assertEqual(tickets[0].getBanTime(), -1); # current jail ban time.
 
 	def testActionWithDB(self):
 		# test action together with database functionality
@@ -404,23 +536,21 @@ class DatabaseTest(LogCaptureTestCase):
 		# Delete jail (just disabled it):
 		self.db.delJail(self.jail)
 		jails = self.db.getJailNames()
-		self.assertTrue(len(jails) == 1 and self.jail.name in jails)
+		self.assertIn(len(jails) == 1 and self.jail.name, jails)
 		jails = self.db.getJailNames(enabled=False)
-		self.assertTrue(len(jails) == 1 and self.jail.name in jails)
+		self.assertIn(len(jails) == 1 and self.jail.name, jails)
 		jails = self.db.getJailNames(enabled=True)
 		self.assertTrue(len(jails) == 0)
 		# Add it again - should just enable it:
 		self.db.addJail(self.jail)
 		jails = self.db.getJailNames()
-		self.assertTrue(len(jails) == 1 and self.jail.name in jails)
+		self.assertIn(len(jails) == 1 and self.jail.name, jails)
 		jails = self.db.getJailNames(enabled=True)
-		self.assertTrue(len(jails) == 1 and self.jail.name in jails)
+		self.assertIn(len(jails) == 1 and self.jail.name, jails)
 		jails = self.db.getJailNames(enabled=False)
 		self.assertTrue(len(jails) == 0)
 
 	def testPurge(self):
-		if Fail2BanDb is None: # pragma: no cover
-			return
 		self.testAddJail() # Add jail
 
 		self.db.purge() # Jail enabled by default so shouldn't be purged

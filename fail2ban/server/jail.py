@@ -29,7 +29,7 @@ import random
 import Queue
 
 from .actions import Actions
-from ..helpers import getLogger
+from ..helpers import getLogger, _as_bool, extractOptions, MyTime
 from .mytime import MyTime
 
 # Gets the instance of the logger.
@@ -83,11 +83,13 @@ class Jail(object):
 		logSys.info("Creating new jail '%s'" % self.name)
 		if backend is not None:
 			self._setBackend(backend)
+		self.backend = backend
 
 	def __repr__(self):
 		return "%s(%r)" % (self.__class__.__name__, self.name)
 
 	def _setBackend(self, backend):
+		backend, beArgs = extractOptions(backend)
 		backend = backend.lower()		# to assure consistent matching
 
 		backends = self._BACKENDS
@@ -104,7 +106,7 @@ class Jail(object):
 		for b in backends:
 			initmethod = getattr(self, '_init%s' % b.capitalize())
 			try:
-				initmethod()
+				initmethod(**beArgs)
 				if backend != 'auto' and b != backend:
 					logSys.warning("Could only initiated %r backend whenever "
 								   "%r was requested" % (b, backend))
@@ -112,7 +114,7 @@ class Jail(object):
 					logSys.info("Initiated %r backend" % b)
 				self.__actions = Actions(self)
 				return					# we are done
-			except ImportError, e: # pragma: no cover
+			except ImportError as e: # pragma: no cover
 				# Log debug if auto, but error if specific
 				logSys.log(
 					logging.DEBUG if backend == "auto" else logging.ERROR,
@@ -124,28 +126,28 @@ class Jail(object):
 		raise RuntimeError(
 			"Failed to initialize any backend for Jail %r" % self.name)
 
-	def _initPolling(self):
+	def _initPolling(self, **kwargs):
 		from filterpoll import FilterPoll
-		logSys.info("Jail '%s' uses poller" % self.name)
-		self.__filter = FilterPoll(self)
+		logSys.info("Jail '%s' uses poller %r" % (self.name, kwargs))
+		self.__filter = FilterPoll(self, **kwargs)
 
-	def _initGamin(self):
+	def _initGamin(self, **kwargs):
 		# Try to import gamin
 		from filtergamin import FilterGamin
-		logSys.info("Jail '%s' uses Gamin" % self.name)
-		self.__filter = FilterGamin(self)
+		logSys.info("Jail '%s' uses Gamin %r" % (self.name, kwargs))
+		self.__filter = FilterGamin(self, **kwargs)
 
-	def _initPyinotify(self):
+	def _initPyinotify(self, **kwargs):
 		# Try to import pyinotify
 		from filterpyinotify import FilterPyinotify
-		logSys.info("Jail '%s' uses pyinotify" % self.name)
-		self.__filter = FilterPyinotify(self)
+		logSys.info("Jail '%s' uses pyinotify %r" % (self.name, kwargs))
+		self.__filter = FilterPyinotify(self, **kwargs)
 
-	def _initSystemd(self): # pragma: systemd no cover
+	def _initSystemd(self, **kwargs): # pragma: systemd no cover
 		# Try to import systemd
 		from filtersystemd import FilterSystemd
-		logSys.info("Jail '%s' uses systemd" % self.name)
-		self.__filter = FilterSystemd(self)
+		logSys.info("Jail '%s' uses systemd %r" % (self.name, kwargs))
+		self.__filter = FilterSystemd(self, **kwargs)
 
 	@property
 	def name(self):
@@ -205,7 +207,8 @@ class Jail(object):
 		Used by actions to get a failure for banning.
 		"""
 		try:
-			return self.__queue.get(False)
+			ticket = self.__queue.get(False)
+			return ticket
 		except Queue.Empty:
 			return False
 
@@ -220,9 +223,8 @@ class Jail(object):
 			del be[opt]
 		logSys.info('Set banTime.%s = %s', opt, value)
 		if opt == 'increment':
-			if isinstance(value, str):
-				be[opt] = value.lower() in ("yes", "true", "ok", "1")
-			if be[opt] and self.database is None:
+			be[opt] = _as_bool(value)
+			if be.get(opt) and self.database is None:
 				logSys.warning("ban time increment is not available as long jail database is not set")
 		if opt in ['maxtime', 'rndtime']:
 			if not value is None:
@@ -260,23 +262,47 @@ class Jail(object):
 			return self._banExtra.get(opt, None)
 		return self._banExtra
 
-	def restoreCurrentBans(self):
+	def getMaxBanTime(self):
+		"""Returns max possible ban-time of jail.
+		"""
+		return self._banExtra.get("maxtime", -1) \
+			if self._banExtra.get('increment') else self.actions.getBanTime()
+
+	def restoreCurrentBans(self, correctBanTime=True):
 		"""Restore any previous valid bans from the database.
 		"""
 		try:
 			if self.database is not None:
-				forbantime = None;
-				# use ban time as search time if we have not enabled a increasing:
-				if not self.getBanTimeExtra('increment'):
+				if self._banExtra.get('increment'):
+					forbantime = None;
+					if correctBanTime:
+						correctBanTime = self.getMaxBanTime()
+				else:
+					# use ban time as search time if we have not enabled a increasing:
 					forbantime = self.actions.getBanTime()
-				for ticket in self.database.getCurrentBans(jail=self, forbantime=forbantime):
-					#logSys.debug('restored ticket: %s', ticket)
-					if not self.filter.inIgnoreIPList(ticket.getIP(), log_ignore=True):
+				for ticket in self.database.getCurrentBans(jail=self, forbantime=forbantime,
+					correctBanTime=correctBanTime
+				):
+					try:
+						#logSys.debug('restored ticket: %s', ticket)
+						if self.filter.inIgnoreIPList(ticket.getIP(), log_ignore=True): continue
 						# mark ticked was restored from database - does not put it again into db:
-						ticket.setRestored(True)
+						ticket.restored = True
+						# correct start time / ban time (by the same end of ban):
+						btm = ticket.getBanTime(forbantime)
+						diftm = MyTime.time() - ticket.getTime()
+						if btm != -1 and diftm > 0:
+							btm -= diftm
+						# ignore obsolete tickets:
+						if btm != -1 and btm <= 0:
+							continue
 						self.putFailTicket(ticket)
+					except Exception as e: # pragma: no cover
+						logSys.error('Restore ticket failed: %s', e, 
+							exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
 		except Exception as e: # pragma: no cover
-			logSys.error('%s', e, exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+			logSys.error('Restore bans failed: %s', e,
+				exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
 
 	def start(self):
 		"""Start the jail, by starting filter and actions threads.
@@ -284,20 +310,30 @@ class Jail(object):
 		Once stated, also queries the persistent database to reinstate
 		any valid bans.
 		"""
+		logSys.debug("Starting jail %r", self.name)
 		self.filter.start()
 		self.actions.start()
 		self.restoreCurrentBans()
+		logSys.info("Jail %r started", self.name)
 
-		logSys.info("Jail '%s' started" % self.name)
-
-	def stop(self):
+	def stop(self, stop=True, join=True):
 		"""Stop the jail, by stopping filter and actions threads.
 		"""
-		self.filter.stop()
-		self.actions.stop()
-		self.filter.join()
-		self.actions.join()
-		logSys.info("Jail '%s' stopped" % self.name)
+		if stop:
+			logSys.debug("Stopping jail %r", self.name)
+		for obj in (self.filter, self.actions):
+			try:
+				## signal to stop filter / actions:
+				if stop:
+					obj.stop()
+				## wait for end of threads:
+				if join:
+					obj.join()
+			except Exception as e:
+				logSys.error("Stop %r of jail %r failed: %s", obj, self.name, e,
+					exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+		if join:
+			logSys.info("Jail %r stopped", self.name)
 
 	def isAlive(self):
 		"""Check jail "isAlive" by checking filter and actions threads.

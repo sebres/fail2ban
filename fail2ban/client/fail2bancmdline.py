@@ -1,4 +1,3 @@
-#!/usr/bin/python
 # emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: t -*-
 # vi: set ft=python sts=4 ts=4 sw=4 noet :
 #
@@ -26,9 +25,9 @@ import logging
 import os
 import sys
 
-from ..version import version
+from ..version import version, normVersion
 from ..protocol import printFormatted
-from ..helpers import getLogger
+from ..helpers import getLogger, str2LogLevel, getVerbosityFormat
 
 # Gets the instance of the logger.
 logSys = getLogger("fail2ban")
@@ -48,6 +47,7 @@ class Fail2banCmdLine():
 	def __init__(self):
 		self._argv = self._args = None
 		self._configurator = None
+		self.cleanConfOnly = False
 		self.resetConf()
 
 	def resetConf(self):
@@ -78,12 +78,11 @@ class Fail2banCmdLine():
 		for o in obj.__dict__:
 			self.__dict__[o] = obj.__dict__[o]
 
-	def dispVersion(self):
-		output("Fail2Ban v" + version)
-		output("")
-		output("Copyright (c) 2004-2008 Cyril Jaquier, 2008- Fail2Ban Contributors")
-		output("Copyright of modifications held by their respective authors.")
-		output("Licensed under the GNU General Public License v2 (GPL).")
+	def dispVersion(self, short=False):
+		if not short:
+			output("Fail2Ban v" + version)
+		else:
+			output(normVersion())
 
 	def dispUsage(self):
 		""" Prints Fail2Ban command line options and exits
@@ -99,9 +98,11 @@ class Fail2banCmdLine():
 		output("    -s <FILE>               socket path")
 		output("    -p <FILE>               pidfile path")
 		output("    --loglevel <LEVEL>      logging level")
-		output("    --logtarget <FILE>|STDOUT|STDERR|SYSLOG")
+		output("    --logtarget <TARGET>    logging target, use file-name or stdout, stderr, syslog or sysout.")
 		output("    --syslogsocket auto|<FILE>")
 		output("    -d                      dump configuration. For debugging")
+		output("    --dp, --dump-pretty     dump the configuration using more human readable representation")
+		output("    -t, --test              test configuration (can be also specified with start parameters)")
 		output("    -i                      interactive mode")
 		output("    -v                      increase verbosity")
 		output("    -q                      decrease verbosity")
@@ -110,8 +111,9 @@ class Fail2banCmdLine():
 		output("    -f                      start server in foreground")
 		output("    --async                 start server in async mode (for internal usage only, don't read configuration)")
 		output("    --timeout               timeout to wait for the server (for internal usage only, don't read configuration)")
+		output("    --str2sec <STRING>      convert time abbreviation format to seconds")
 		output("    -h, --help              display this help message")
-		output("    -V, --version           print the version")
+		output("    -V, --version           print the version (-V returns machine-readable short format)")
 
 		if not caller.endswith('server'):
 			output("")
@@ -135,8 +137,11 @@ class Fail2banCmdLine():
 				self._conf["pidfile"] = opt[1]
 			elif o.startswith("--log") or o.startswith("--sys"):
 				self._conf[ o[2:] ] = opt[1]
-			elif o == "-d":
-				self._conf["dump"] = True
+			elif o in ["-d", "--dp", "--dump-pretty"]:
+				self._conf["dump"] = True if o == "-d" else 2
+			elif o == "-t" or o == "--test":
+				self.cleanConfOnly = True
+				self._conf["test"] = True
 			elif o == "-v":
 				self._conf["verbose"] += 1
 			elif o == "-q":
@@ -151,14 +156,18 @@ class Fail2banCmdLine():
 				self._conf["background"] = False
 			elif o == "--async":
 				self._conf["async"] = True
-			elif o == "-timeout":
-				from ..mytime import MyTime
+			elif o == "--timeout":
+				from ..server.mytime import MyTime
 				self._conf["timeout"] = MyTime.str2seconds(opt[1])
+			elif o == "--str2sec":
+				from ..server.mytime import MyTime
+				output(MyTime.str2seconds(opt[1]))
+				return True
 			elif o in ["-h", "--help"]:
 				self.dispUsage()
 				return True
 			elif o in ["-V", "--version"]:
-				self.dispVersion()
+				self.dispVersion(o == "-V")
 				return True
 		return None
 
@@ -174,8 +183,9 @@ class Fail2banCmdLine():
 
 			# Reads the command line options.
 			try:
-				cmdOpts = 'hc:s:p:xfbdviqV'
-				cmdLongOpts = ['loglevel=', 'logtarget=', 'syslogsocket=', 'async', 'timeout=', 'help', 'version']
+				cmdOpts = 'hc:s:p:xfbdtviqV'
+				cmdLongOpts = ['loglevel=', 'logtarget=', 'syslogsocket=', 'test', 'async',
+					'timeout=', 'str2sec=', 'help', 'version', 'dp', '--dump-pretty']
 				optList, self._args = getopt.getopt(self._argv[1:], cmdOpts, cmdLongOpts)
 			except getopt.GetoptError:
 				self.dispUsage()
@@ -201,8 +211,10 @@ class Fail2banCmdLine():
 					logSys.setLevel(logging.HEAVYDEBUG)
 				# Add the default logging handler to dump to stderr
 				logout = logging.StreamHandler(sys.stderr)
-				# set a format which is simpler for console use
-				formatter = logging.Formatter('%(levelname)-6s %(message)s')
+
+				# Custom log format for the verbose run (-1, because default verbosity here is 1):
+				fmt = getVerbosityFormat(verbose-1)
+				formatter = logging.Formatter(fmt)
 				# tell the handler to use this format
 				logout.setFormatter(formatter)
 				logSys.addHandler(logout)
@@ -219,16 +231,38 @@ class Fail2banCmdLine():
 
 			logSys.info("Using socket file %s", self._conf["socket"])
 
+			# Check log-level before start (or transmit to server), to prevent error in background:
+			llev = str2LogLevel(self._conf["loglevel"])
 			logSys.info("Using pid file %s, [%s] logging to %s",
-				self._conf["pidfile"], self._conf["loglevel"], self._conf["logtarget"])
+				self._conf["pidfile"], logging.getLevelName(llev), self._conf["logtarget"])
 
+			readcfg = True
 			if self._conf.get("dump", False):
-				ret, stream = self.readConfig()
-				self.dumpConfig(stream)
-				return ret
+				if readcfg:
+					ret, stream = self.readConfig()
+					readcfg = False
+				if stream is not None:
+					self.dumpConfig(stream, self._conf["dump"] == 2)
+				else: # pragma: no cover
+					output("ERROR: The configuration stream failed because of the invalid syntax.")
+				if not self._conf.get("test", False):
+					return ret
+
+			if self._conf.get("test", False):
+				if readcfg:
+					readcfg = False
+					ret, stream = self.readConfig()
+				if not ret:
+					raise ServerExecutionException("ERROR: test configuration failed")
+				# exit after test if no commands specified (test only):
+				if not len(self._args):
+					output("OK: configuration test is successful")
+					return ret
 
 			# Nothing to do here, process in client/server
 			return None
+		except ServerExecutionException:
+			raise
 		except Exception as e:
 			output("ERROR: %s" % (e,))
 			if verbose > 2:
@@ -243,18 +277,26 @@ class Fail2banCmdLine():
 		try:
 			self.configurator.Reload()
 			self.configurator.readAll()
-			ret = self.configurator.getOptions(jail)
-			self.configurator.convertToProtocol()
+			ret = self.configurator.getOptions(jail, self._conf, 
+				ignoreWrong=not self.cleanConfOnly)
+			self.configurator.convertToProtocol(
+				allow_no_files=self._conf.get("dump", False))
 			stream = self.configurator.getConfigStream()
-		except Exception, e:
+		except Exception as e:
 			logSys.error("Failed during configuration: %s" % e)
 			ret = False
 		return ret, stream
 
 	@staticmethod
-	def dumpConfig(cmd):
+	def dumpConfig(cmd, pretty=False):
+		if pretty:
+			from pprint import pformat
+			def _output(s):
+				output(pformat(s, width=1000, indent=2))
+		else:
+			_output = output
 		for c in cmd:
-			output(c)
+			_output(c)
 		return True
 
 	#
@@ -271,6 +313,7 @@ class Fail2banCmdLine():
 	def exit(code=0):
 		logSys.debug("Exit with code %s", code)
 		# because of possible buffered output in python, we should flush it before exit:
+		logging.shutdown()
 		sys.stdout.flush()
 		sys.stderr.flush()
 		# exit

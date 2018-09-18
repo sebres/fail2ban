@@ -22,7 +22,7 @@ __copyright__ = "Copyright (c) 2004 Cyril Jaquier, 2013- Yaroslav Halchenko"
 __license__ = "GPL"
 
 from ..exceptions import UnknownJailException, DuplicateJailException
-from ..helpers import getLogger
+from ..helpers import getLogger, logging
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
@@ -46,7 +46,7 @@ class Beautifier:
 		return self.__inputCmd
 
 	def beautify(self, response):
-		logSys.debug(
+		logSys.log(5,
 			"Beautify " + repr(response) + " with " + repr(self.__inputCmd))
 		inC = self.__inputCmd
 		msg = response
@@ -89,6 +89,8 @@ class Beautifier:
 						val = " ".join(map(str, res1[1])) if isinstance(res1[1], list) else res1[1]
 						msg.append("%s %s:\t%s" % (prefix1, res1[0], val))
 				msg = "\n".join(msg)
+			elif len(inC) < 2:
+				pass # to few cmd args for below
 			elif inC[1] == "syslogsocket":
 				msg = "Current syslog socket is:\n"
 				msg += "`- " + response
@@ -97,16 +99,7 @@ class Beautifier:
 				msg += "`- " + response
 			elif inC[1:2] == ['loglevel']:
 				msg = "Current logging level is "
-				if response == 1:
-					msg += "ERROR"
-				elif response == 2:
-					msg += "WARN"
-				elif response == 3:
-					msg += "INFO"
-				elif response == 4:
-					msg += "DEBUG"
-				else:
-					msg += repr(response)
+				msg += repr(logging.getLevelName(response) if isinstance(response, int) else response)
 			elif inC[1] == "dbfile":
 				if response is None:
 					msg = "Database currently disabled"
@@ -119,6 +112,8 @@ class Beautifier:
 				else:
 					msg = "Current database purge age is:\n"
 					msg += "`- %iseconds" % response
+			elif len(inC) < 3:
+				pass # to few cmd args for below
 			elif inC[2] in ("logpath", "addlogpath", "dellogpath"):
 				if len(response) == 0:
 					msg = "No file is currently monitored"
@@ -187,14 +182,13 @@ class Beautifier:
 					msg += ", ".join(response)
 		except Exception:
 			logSys.warning("Beautifier error. Please report the error")
-			logSys.error("Beautify " + repr(response) + " with "
-				+ repr(self.__inputCmd) + " failed")
-			msg += repr(response)
+			logSys.error("Beautify %r with %r failed", response, self.__inputCmd,
+				exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+			msg = repr(msg) + repr(response)
 		return msg
 
 	def beautifyError(self, response):
-		logSys.debug("Beautify (error) " + repr(response) + " with "
-					 + repr(self.__inputCmd))
+		logSys.debug("Beautify (error) %r with %r", response, self.__inputCmd)
 		msg = response
 		if isinstance(response, UnknownJailException):
 			msg = "Sorry but the jail '" + response.args[0] + "' does not exist"

@@ -36,12 +36,14 @@ class AddFailure(unittest.TestCase):
 
 	def setUp(self):
 		"""Call before every test case."""
+		super(AddFailure, self).setUp()
 		self.__items = None
 		self.__failManager = FailManager()
 
 	def tearDown(self):
 		"""Call after every test case."""
-
+		super(AddFailure, self).tearDown()
+		
 	def _addDefItems(self):
 		self.__items = [[u'193.168.0.128', 1167605999.0],
 					    [u'193.168.0.128', 1167605999.0],

@@ -28,13 +28,13 @@ import unittest
 import tempfile
 import shutil
 import fnmatch
-import datetime
 from glob import glob
 from StringIO import StringIO
 
-from ..helpers import formatExceptionInfo, mbasename, TraceBack, FormatterWithTraceBack, getLogger
-from ..helpers import splitwords
-from ..server.datetemplate import DatePatternRegex
+from utils import LogCaptureTestCase, logSys as DefLogSys
+
+from ..helpers import formatExceptionInfo, mbasename, TraceBack, FormatterWithTraceBack, getLogger, \
+	splitwords, uni_decode, uni_string
 from ..server.mytime import MyTime
 
 
@@ -68,20 +68,25 @@ class HelpersTest(unittest.TestCase):
 		self.assertEqual(splitwords(' 1\n  2, 3'), ['1', '2', '3'])
 
 
+if sys.version_info >= (2,7):
+	def _sh_call(cmd):
+		import subprocess
+		ret = subprocess.check_output(cmd, shell=True)
+		return uni_decode(ret).rstrip()
+else:
+	def _sh_call(cmd):
+		import subprocess
+		ret = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE).stdout.read()
+		return uni_decode(ret).rstrip()
+
 def _getSysPythonVersion():
-	import subprocess, locale
-	sysVerCmd = "python -c 'import sys; print(tuple(sys.version_info))'"
-	if sys.version_info >= (2,7):
-		sysVer = subprocess.check_output(sysVerCmd, shell=True)
-	else:
-		sysVer = subprocess.Popen(sysVerCmd, shell=True, stdout=subprocess.PIPE).stdout.read()
-	if sys.version_info >= (3,):
-		sysVer = sysVer.decode(locale.getpreferredencoding(), 'replace')
-	return str(sysVer).rstrip()
+	return _sh_call("fail2ban-python -c 'import sys; print(tuple(sys.version_info))'")
+
 
 class SetupTest(unittest.TestCase):
 
 	def setUp(self):
+		super(SetupTest, self).setUp()
 		unittest.F2B.SkipIfFast()
 		setup = os.path.join(os.path.dirname(__file__), '..', '..', 'setup.py')
 		self.setup = os.path.exists(setup) and setup or None
@@ -96,13 +101,32 @@ class SetupTest(unittest.TestCase):
 				"Seems to be running with python distribution %s"
 				" -- install can be tested only with system distribution %s" % (str(tuple(sys.version_info)), sysVer))
 
+	def testSetupInstallDryRun(self):
+		if not self.setup:
+			return			  # if verbose skip didn't work out
+		tmp = tempfile.mkdtemp()
+		# suppress stdout (and stderr) if not heavydebug
+		supdbgout = ' >/dev/null 2>&1' if unittest.F2B.log_level >= logging.DEBUG else '' # HEAVYDEBUG
+		try:
+			# try dry-run:
+			os.system("%s %s --dry-run install --disable-2to3 --root=%s%s"
+					  % (sys.executable, self.setup , tmp, supdbgout))
+			# check nothing was created:
+			self.assertTrue(not os.listdir(tmp))
+		finally:
+			# clean up
+			shutil.rmtree(tmp)
+
 	def testSetupInstallRoot(self):
 		if not self.setup:
 			return			  # if verbose skip didn't work out
 		tmp = tempfile.mkdtemp()
+		remove_build = not os.path.exists('build')
+		# suppress stdout (and stderr) if not heavydebug
+		supdbgout = ' >/dev/null' if unittest.F2B.log_level >= logging.DEBUG else '' # HEAVYDEBUG
 		try:
-			os.system("%s %s install --root=%s >/dev/null"
-					  % (sys.executable, self.setup, tmp))
+			self.assertEqual(os.system("%s %s install --disable-2to3 --root=%s%s"
+					  % (sys.executable, self.setup, tmp, supdbgout)), 0)
 
 			def strippath(l):
 				return [x[len(tmp)+1:] for x in l]
@@ -141,15 +165,25 @@ class SetupTest(unittest.TestCase):
 					  'etc/fail2ban/jail.conf'):
 				self.assertTrue(os.path.exists(os.path.join(tmp, f)),
 								msg="Can't find %s" % f)
+			# Because the install (test) path in virtual-env differs from some development-env,
+			# it is not a `tmp + '/usr/local/bin/'`, so search for it:
+			installedPath = _sh_call('find ' + tmp+ ' -name fail2ban-python').split('\n')
+			self.assertTrue(len(installedPath) > 0)
+			for installedPath in installedPath:
+				self.assertEqual(
+					os.path.realpath(installedPath), os.path.realpath(sys.executable))
+
 		finally:
 			# clean up
 			shutil.rmtree(tmp)
 			# remove build directory
-			os.system("%s %s clean --all >/dev/null 2>&1"
-					  % (sys.executable, self.setup))
+			os.system("%s %s clean --all%s"
+					  % (sys.executable, self.setup, (supdbgout + ' 2>&1') if supdbgout else ''))
+			if remove_build and os.path.exists('build'):
+				shutil.rmtree('build')
 
 
-class TestsUtilsTest(unittest.TestCase):
+class TestsUtilsTest(LogCaptureTestCase):
 
 	def testmbasename(self):
 		self.assertEqual(mbasename("sample.py"), 'sample')
@@ -158,6 +192,56 @@ class TestsUtilsTest(unittest.TestCase):
 		self.assertEqual(mbasename("/long/path/__init__.py"), 'path.__init__')
 		self.assertEqual(mbasename("/long/path/base.py"), 'path.base')
 		self.assertEqual(mbasename("/long/path/base"), 'path.base')
+
+	def testUniConverters(self):
+		self.assertRaises(Exception, uni_decode, 
+			(b'test' if sys.version_info >= (3,) else u'test'), 'f2b-test::non-existing-encoding')
+		uni_decode((b'test\xcf' if sys.version_info >= (3,) else u'test\xcf'))
+		uni_string(b'test\xcf')
+		uni_string('test\xcf')
+		uni_string(u'test\xcf')
+
+	def testSafeLogging(self):
+		# logging should be exception-safe, to avoid possible errors (concat, str. conversion, representation failures, etc)
+		logSys = DefLogSys
+		class Test:
+			def __init__(self, err=1):
+				self.err = err
+			def __repr__(self):
+				if self.err:
+					raise Exception('no represenation for test!')
+				else:
+					return u'conv-error (\xf2\xf0\xe5\xf2\xe8\xe9), unterminated utf \xcf'
+		test = Test()
+		logSys.log(logging.NOTICE, "test 1a: %r", test)
+		self.assertLogged("Traceback", "no represenation for test!")
+		self.pruneLog()
+		logSys.notice("test 1b: %r", test)
+		self.assertLogged("Traceback", "no represenation for test!")
+
+		self.pruneLog('[phase 2] test error conversion by encoding %s' % sys.getdefaultencoding())
+		test = Test(0)
+		# this may produce coversion error on ascii default encoding:
+		#str(test)
+		logSys.log(logging.NOTICE, "test 2a: %r, %s", test, test)
+		self.assertLogged("test 2a", "Error by logging handler", all=False)
+		logSys.notice("test 2b: %r, %s", test, test)
+		self.assertLogged("test 2b", "Error by logging handler", all=False)
+
+		self.pruneLog('[phase 3] test unexpected error in handler')
+		class _ErrorHandler(logging.Handler):
+			def handle(self, record):
+				raise Exception('error in handler test!')
+		_org_handler = logSys.handlers
+		try:
+			logSys.handlers = list(logSys.handlers)
+			logSys.handlers += [_ErrorHandler()]
+			logSys.log(logging.NOTICE, "test 3a")
+			logSys.notice("test 3b")
+		finally:
+			logSys.handlers = _org_handler
+		# we should reach this line without errors!
+		self.pruneLog('OK')
 
 	def testTraceBack(self):
 		# pretty much just a smoke test since tests runners swallow all the detail
@@ -184,12 +268,131 @@ class TestsUtilsTest(unittest.TestCase):
 			if not ('fail2ban-testcases' in s):
 				# we must be calling it from setup or nosetests but using at least
 				# nose's core etc
-				self.assertTrue('>' in s, msg="no '>' in %r" % s)
+				self.assertIn('>', s)
 			elif not ('coverage' in s):
 				# There is only "fail2ban-testcases" in this case, no true traceback
-				self.assertFalse('>' in s, msg="'>' present in %r" % s)
+				self.assertNotIn('>', s)
 
-			self.assertTrue(':' in s, msg="no ':' in %r" % s)
+			self.assertIn(':', s)
+
+	def _testAssertionErrorRE(self, regexp, fun, *args, **kwargs):
+		self.assertRaisesRegexp(AssertionError, regexp, fun, *args, **kwargs)
+	
+	def testExtendedAssertRaisesRE(self):
+		## test _testAssertionErrorRE several fail cases:
+		def _key_err(msg):
+			raise KeyError(msg)			
+		self.assertRaises(KeyError,
+			self._testAssertionErrorRE, r"^failed$", 
+				_key_err, 'failed')
+		self.assertRaises(AssertionError,
+			self._testAssertionErrorRE, r"^failed$",
+				self.fail, '__failed__')
+		self._testAssertionErrorRE(r'failed.* does not match .*__failed__',
+			lambda: self._testAssertionErrorRE(r"^failed$",
+				self.fail, '__failed__')
+		)
+		## no exception in callable:
+		self.assertRaises(AssertionError,
+			self._testAssertionErrorRE, r"", int, 1)
+		self._testAssertionErrorRE(r'0 AssertionError not raised X.* does not match .*AssertionError not raised',
+			lambda: self._testAssertionErrorRE(r"^0 AssertionError not raised X$",
+				lambda: self._testAssertionErrorRE(r"", int, 1))
+		)
+
+	def testExtendedAssertMethods(self):
+		## assertIn, assertNotIn positive case:
+		self.assertIn('a', ['a', 'b', 'c', 'd'])
+		self.assertIn('a', ('a', 'b', 'c', 'd',))
+		self.assertIn('a', 'cba')
+		self.assertIn('a', (c for c in 'cba' if c != 'b'))
+		self.assertNotIn('a', ['b', 'c', 'd'])
+		self.assertNotIn('a', ('b', 'c', 'd',))
+		self.assertNotIn('a', 'cbd')
+		self.assertNotIn('a', (c.upper() for c in 'cba' if c != 'b'))
+		## assertIn, assertNotIn negative case:
+		self._testAssertionErrorRE(r"'a' unexpectedly found in 'cba'",
+			self.assertNotIn, 'a', 'cba')
+		self._testAssertionErrorRE(r"1 unexpectedly found in \[0, 1, 2\]",
+			self.assertNotIn, 1, xrange(3))
+		self._testAssertionErrorRE(r"'A' unexpectedly found in \['C', 'A'\]",
+			self.assertNotIn, 'A', (c.upper() for c in 'cba' if c != 'b'))
+		self._testAssertionErrorRE(r"'a' was not found in 'xyz'",
+			self.assertIn, 'a', 'xyz')
+		self._testAssertionErrorRE(r"5 was not found in \[0, 1, 2\]",
+			self.assertIn, 5, xrange(3))
+		self._testAssertionErrorRE(r"'A' was not found in \['C', 'B'\]",
+			self.assertIn, 'A', (c.upper() for c in 'cba' if c != 'a'))
+		## assertLogged, assertNotLogged positive case:
+		logSys = DefLogSys
+		self.pruneLog()
+		logSys.debug('test "xyz"')
+		self.assertLogged('test "xyz"')
+		self.assertLogged('test', 'xyz', all=True)
+		self.assertNotLogged('test', 'zyx', all=False)
+		self.assertNotLogged('test_zyx', 'zyx', all=True)
+		self.assertLogged('test', 'zyx', all=False)
+		self.pruneLog()
+		logSys.debug('xxxx "xxx"')
+		self.assertNotLogged('test "xyz"')
+		self.assertNotLogged('test', 'xyz', all=False)
+		self.assertNotLogged('test', 'xyz', 'zyx', all=True)
+		## maxWaitTime:
+		orgfast, unittest.F2B.fast = unittest.F2B.fast, False
+		self.assertFalse(isinstance(unittest.F2B.maxWaitTime(True), bool))
+		self.assertEqual(unittest.F2B.maxWaitTime(lambda: 50)(), 50)
+		self.assertEqual(unittest.F2B.maxWaitTime(25), 25)
+		self.assertEqual(unittest.F2B.maxWaitTime(25.), 25.0)
+		unittest.F2B.fast = True
+		try:
+			self.assertEqual(unittest.F2B.maxWaitTime(lambda: 50)(), 50)
+			self.assertEqual(unittest.F2B.maxWaitTime(25), 2.5)
+			self.assertEqual(unittest.F2B.maxWaitTime(25.), 25.0)
+		finally:
+			unittest.F2B.fast = orgfast
+		self.assertFalse(unittest.F2B.maxWaitTime(False))
+		## assertLogged, assertNotLogged negative case:
+		self.pruneLog()
+		logSys.debug('test "xyz"')
+		self._testAssertionErrorRE(r".* was found in the log",
+			self.assertNotLogged, 'test "xyz"')
+		self._testAssertionErrorRE(r"All of the .* were found present in the log",
+			self.assertNotLogged, 'test "xyz"', 'test')
+		self._testAssertionErrorRE(r"was found in the log",
+			self.assertNotLogged, 'test', 'xyz', all=True)
+		self._testAssertionErrorRE(r"was not found in the log",
+			self.assertLogged, 'test', 'zyx', all=True)
+		self._testAssertionErrorRE(r"was not found in the log, waited 1e-06",
+			self.assertLogged, 'test', 'zyx', all=True, wait=1e-6)
+		self._testAssertionErrorRE(r"None among .* was found in the log",
+			self.assertLogged, 'test_zyx', 'zyx', all=False)
+		self._testAssertionErrorRE(r"None among .* was found in the log, waited 1e-06",
+			self.assertLogged, 'test_zyx', 'zyx', all=False, wait=1e-6)
+		self._testAssertionErrorRE(r"All of the .* were found present in the log",
+			self.assertNotLogged, 'test', 'xyz', all=False)
+		## assertDictEqual:
+		self.assertDictEqual({'A': [1, 2]}, {'A': [1, 2]})
+		self.assertRaises(AssertionError, self.assertDictEqual, 
+			{'A': [1, 2]}, {'A': [2, 1]})
+		## assertSortedEqual:
+		self.assertSortedEqual(['A', 'B'], ['B', 'A'])
+		self.assertSortedEqual([['A', 'B']], [['B', 'A']], level=2)
+		self.assertSortedEqual([['A', 'B']], [['B', 'A']], nestedOnly=False)
+		self.assertRaises(AssertionError, lambda: self.assertSortedEqual(
+			[['A', 'B']], [['B', 'A']], level=1, nestedOnly=True))
+		self.assertSortedEqual({'A': ['A', 'B']}, {'A': ['B', 'A']}, nestedOnly=False)
+		self.assertRaises(AssertionError, lambda: self.assertSortedEqual(
+			{'A': ['A', 'B']}, {'A': ['B', 'A']}, level=1, nestedOnly=True))
+		self.assertSortedEqual(['Z', {'A': ['B', 'C'], 'B': ['E', 'F']}], [{'B': ['F', 'E'], 'A': ['C', 'B']}, 'Z'],
+			nestedOnly=False)
+		self.assertSortedEqual(['Z', {'A': ['B', 'C'], 'B': ['E', 'F']}], [{'B': ['F', 'E'], 'A': ['C', 'B']}, 'Z'],
+			level=-1)
+		self.assertRaises(AssertionError, lambda: self.assertSortedEqual(
+			['Z', {'A': ['B', 'C'], 'B': ['E', 'F']}], [{'B': ['F', 'E'], 'A': ['C', 'B']}, 'Z']))
+		self._testAssertionErrorRE(r"\['A'\] != \['C', 'B'\]",
+			self.assertSortedEqual, ['A'], ['C', 'B'])
+		self._testAssertionErrorRE(r"\['A', 'B'\] != \['B', 'C'\]",
+			self.assertSortedEqual, ['A', 'B'], ['C', 'B'])
 
 	def testFormatterWithTraceBack(self):
 		strout = StringIO()
@@ -211,45 +414,13 @@ class TestsUtilsTest(unittest.TestCase):
 		self.assertTrue(pindex > 10)	  # we should have some traceback
 		self.assertEqual(s[:pindex], s[pindex+1:pindex*2 + 1])
 
-iso8601 = DatePatternRegex("%Y-%m-%d[T ]%H:%M:%S(?:\.%f)?%z")
+	def testLazyLogging(self):
+		logSys = DefLogSys
+		logSys.debug('lazy logging: %r', unittest.F2B.log_lazy)
+		# wrong logging syntax will don't throw an error anymore (logged now):
+		logSys.notice('test', 1, 2, 3)
+		self.assertLogged('not all arguments converted')
 
-
-class CustomDateFormatsTest(unittest.TestCase):
-
-	def testIso8601(self):
-		date = datetime.datetime.utcfromtimestamp(
-			iso8601.getDate("2007-01-25T12:00:00Z")[0])
-		self.assertEqual(
-			date,
-			datetime.datetime(2007, 1, 25, 12, 0))
-		self.assertRaises(TypeError, iso8601.getDate, None)
-		self.assertRaises(TypeError, iso8601.getDate, date)
-
-		self.assertEqual(iso8601.getDate(""), None)
-		self.assertEqual(iso8601.getDate("Z"), None)
-
-		self.assertEqual(iso8601.getDate("2007-01-01T120:00:00Z"), None)
-		self.assertEqual(iso8601.getDate("2007-13-01T12:00:00Z"), None)
-		date = datetime.datetime.utcfromtimestamp(
-			iso8601.getDate("2007-01-25T12:00:00+0400")[0])
-		self.assertEqual(
-			date,
-			datetime.datetime(2007, 1, 25, 8, 0))
-		date = datetime.datetime.utcfromtimestamp(
-			iso8601.getDate("2007-01-25T12:00:00+04:00")[0])
-		self.assertEqual(
-			date,
-			datetime.datetime(2007, 1, 25, 8, 0))
-		date = datetime.datetime.utcfromtimestamp(
-			iso8601.getDate("2007-01-25T12:00:00-0400")[0])
-		self.assertEqual(
-			date,
-			datetime.datetime(2007, 1, 25, 16, 0))
-		date = datetime.datetime.utcfromtimestamp(
-			iso8601.getDate("2007-01-25T12:00:00-04")[0])
-		self.assertEqual(
-			date,
-			datetime.datetime(2007, 1, 25, 16, 0))
 
 class MyTimeTest(unittest.TestCase):
 

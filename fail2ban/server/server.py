@@ -27,7 +27,6 @@ __license__ = "GPL"
 import threading
 from threading import Lock, RLock
 import logging
-import logging.handlers
 import os
 import signal
 import stat
@@ -39,7 +38,8 @@ from .filter import FileFilter, JournalFilter
 from .transmitter import Transmitter
 from .asyncserver import AsyncServer, AsyncServerException
 from .. import version
-from ..helpers import getLogger, excepthook
+from ..helpers import getLogger, _as_bool, extractOptions, str2LogLevel, \
+	getVerbosityFormat, excepthook
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
@@ -68,10 +68,12 @@ class Server:
 		self.__db = None
 		self.__daemon = daemon
 		self.__transm = Transmitter(self)
+		self.__reload_state = {}
 		#self.__asyncServer = AsyncServer(self.__transm)
 		self.__asyncServer = None
 		self.__logLevel = None
 		self.__logTarget = None
+		self.__verbose = None
 		self.__syslogSocket = None
 		self.__autoSyslogSocketPaths = {
 			'Darwin':  '/var/run/syslog',
@@ -80,12 +82,12 @@ class Server:
 		}
 		self.__prev_signals = {}
 
-	def __sigTERMhandler(self, signum, frame):
-		logSys.debug("Caught signal %d. Exiting" % signum)
+	def __sigTERMhandler(self, signum, frame): # pragma: no cover - indirect tested
+		logSys.debug("Caught signal %d. Exiting", signum)
 		self.quit()
 	
-	def __sigUSR1handler(self, signum, fname):
-		logSys.debug("Caught signal %d. Flushing logs" % signum)
+	def __sigUSR1handler(self, signum, fname): # pragma: no cover - indirect tested
+		logSys.debug("Caught signal %d. Flushing logs", signum)
 		self.flushLogs()
 
 	def _rebindSignal(self, s, new):
@@ -111,6 +113,7 @@ class Server:
 			# We are daemon.
 		
 		# Set all logging parameters (or use default if not specified):
+		self.__verbose = conf.get("verbose", None)
 		self.setSyslogSocket(conf.get("syslogsocket", 
 			self.__syslogSocket if self.__syslogSocket is not None else DEF_SYSLOGSOCKET))
 		self.setLogLevel(conf.get("loglevel", 
@@ -135,12 +138,12 @@ class Server:
 
 		# Creates a PID file.
 		try:
-			logSys.debug("Creating PID file %s" % pidfile)
+			logSys.debug("Creating PID file %s", pidfile)
 			pidFile = open(pidfile, 'w')
 			pidFile.write("%s\n" % os.getpid())
 			pidFile.close()
-		except IOError, e:
-			logSys.error("Unable to create PID file: %s" % e)
+		except (OSError, IOError) as e: # pragma: no cover
+			logSys.error("Unable to create PID file: %s", e)
 		
 		# Create observers and start it:
 		if observer:
@@ -152,22 +155,27 @@ class Server:
 		logSys.debug("Starting communication")
 		try:
 			self.__asyncServer = AsyncServer(self.__transm)
+			self.__asyncServer.onstart = conf.get('onstart')
 			self.__asyncServer.start(sock, force)
-		except AsyncServerException, e:
+		except AsyncServerException as e:
 			logSys.error("Could not start server: %s", e)
+
+		# Stop (if not yet already executed):
+		self.quit()
+
 		# Removes the PID file.
 		try:
-			logSys.debug("Remove PID file %s" % pidfile)
+			logSys.debug("Remove PID file %s", pidfile)
 			os.remove(pidfile)
-		except OSError, e:
-			logSys.error("Unable to remove PID file: %s" % e)
-		# Stop observer and exit
-		if Observers.Main is not None:
-			Observers.Main.stop()
-			Observers.Main = None
-		logSys.info("Exiting Fail2ban")
-	
+		except (OSError, IOError) as e: # pragma: no cover
+			logSys.error("Unable to remove PID file: %s", e)
+
 	def quit(self):
+		# Prevent to call quit twice:
+		self.quit = lambda: False
+
+		logSys.info("Shutdown in progress...")
+
 		# Stop communication first because if jail's unban action
 		# tries to communicate via fail2ban-client we get a lockup
 		# among threads.  So the simplest resolution is to stop all
@@ -175,62 +183,143 @@ class Server:
 		# are exiting)
 		# See https://github.com/fail2ban/fail2ban/issues/7
 		if self.__asyncServer is not None:
-			self.__asyncServer.stop()
-			self.__asyncServer = None
-
-		# Now stop all the jails
-		self.stopAllJail()
-
-		# Only now shutdown the logging.
-		if self.__logTarget is not None:
-			with self.__loggingLock:
-				logging.shutdown()
+			self.__asyncServer.stop_communication()
 
 		# Restore default signal handlers:
 		if _thread_name() == '_MainThread':
 			for s, sh in self.__prev_signals.iteritems():
 				signal.signal(s, sh)
 
-		# Prevent to call quit twice:
-		self.quit = lambda: False
+		# Give observer a small chance to complete its work before exit
+		if Observers.Main is not None:
+			Observers.Main.stop()
+
+		# Now stop all the jails
+		self.stopAllJail()
+
+		# Explicit close database (server can leave in a thread, 
+		# so delayed GC can prevent commiting changes)
+		if self.__db:
+			self.__db.close()
+			self.__db = None
+
+		# Stop observer and exit
+		if Observers.Main is not None:
+			Observers.Main.stop()
+			Observers.Main = None
+		# Stop async
+		if self.__asyncServer is not None:
+			self.__asyncServer.stop()
+			self.__asyncServer = None
+		logSys.info("Exiting Fail2ban")
+
 
 	def addJail(self, name, backend):
-		# Add jail hereafter:
-		self.__jails.add(name, backend, self.__db)
+		addflg = True
+		if self.__reload_state.get(name) and self.__jails.exists(name):
+			jail = self.__jails[name]
+			# if backend switch - restart instead of reload:
+			if jail.backend == backend:
+				addflg = False
+				logSys.info("Reload jail %r", name)
+				# prevent to reload the same jail twice (temporary keep it in state, needed to commit reload):
+				self.__reload_state[name] = None
+			else:
+				logSys.info("Restart jail %r (reason: %r != %r)", name, jail.backend, backend)
+				self.delJail(name, stop=True)
+				# prevent to start the same jail twice (no reload more - restart):
+				del self.__reload_state[name]
+		if addflg:
+			self.__jails.add(name, backend, self.__db)
 		if self.__db is not None:
 			self.__db.addJail(self.__jails[name])
-
-	def delJail(self, name):
-		if self.__db is not None:
-			self.__db.delJail(self.__jails[name])
-		del self.__jails[name]
+		
+	def delJail(self, name, stop=True, join=True):
+		jail = self.__jails[name]
+		if join or jail.isAlive():
+			jail.stop(stop=stop, join=join)
+		if join:
+			if self.__db is not None:
+				self.__db.delJail(jail)
+			del self.__jails[name]
 
 	def startJail(self, name):
-		try:
-			self.__lock.acquire()
-			if not self.__jails[name].isAlive():
-				self.__jails[name].start()
-		finally:
-			self.__lock.release()
+		with self.__lock:
+			jail = self.__jails[name]
+			if not jail.isAlive():
+				jail.start()
+			elif name in self.__reload_state:
+				logSys.info("Jail %r reloaded", name)
+				del self.__reload_state[name]
+			if jail.idle:
+				jail.idle = False
 	
 	def stopJail(self, name):
-		logSys.debug("Stopping jail %s" % name)
-		try:
-			self.__lock.acquire()
-			if self.__jails[name].isAlive():
-				self.__jails[name].stop()
-				self.delJail(name)
-		finally:
-			self.__lock.release()
+		with self.__lock:
+			self.delJail(name, stop=True)
 	
 	def stopAllJail(self):
 		logSys.info("Stopping all jails")
-		try:
-			self.__lock.acquire()
-			for jail in self.__jails.keys():
-				self.stopJail(jail)
-		finally:
-			self.__lock.release()
+		with self.__lock:
+			# 1st stop all jails (signal and stop actions/filter thread):
+			for name in self.__jails.keys():
+				self.delJail(name, stop=True, join=False)
+			# 2nd wait for end and delete jails:
+			for name in self.__jails.keys():
+				self.delJail(name, stop=False, join=True)
+
+	def reloadJails(self, name, opts, begin):
+		if begin:
+			# begin reload:
+			if self.__reload_state and (name == '--all' or self.__reload_state.get(name)): # pragma: no cover
+				raise ValueError('Reload already in progress')
+			logSys.info("Reload " + (("jail %s" % name) if name != '--all' else "all jails"))
+			with self.__lock:
+				# if single jail:
+				if name != '--all':
+					jail = None
+					# test jail exists (throws exception if not):
+					if "--if-exists" not in opts or self.__jails.exists(name):
+						jail = self.__jails[name]
+					if jail:
+						# first unban all ips (will be not restored after (re)start):
+						if "--unban" in opts:
+							self.setUnbanIP(name)
+						# stop if expected:
+						if "--restart" in opts:
+							self.stopJail(name)
+				else:
+					# first unban all ips (will be not restored after (re)start):
+					if "--unban" in opts:
+						self.setUnbanIP()
+					# stop if expected:
+					if "--restart" in opts:
+						self.stopAllJail()
+				# first set all affected jail(s) to idle and reset filter regex and other lists/dicts:
+				for jn, jail in self.__jails.iteritems():
+					if name == '--all' or jn == name:
+						jail.idle = True
+						self.__reload_state[jn] = jail
+						jail.filter.reload(begin=True)
+						jail.actions.reload(begin=True)
+				pass
+		else:
+			# end reload, all affected (or new) jails have already all new parameters (via stream) and (re)started:
+			with self.__lock:
+				deljails = []
+				for jn, jail in self.__jails.iteritems():
+					# still in reload state:
+					if jn in self.__reload_state:
+						# remove jails that are not reloaded (untouched, so not in new configuration)
+						deljails.append(jn)
+					else:
+						# commit (reload was finished):
+						jail.filter.reload(begin=False)
+						jail.actions.reload(begin=False)
+				for jn in deljails:
+					self.delJail(jn)
+			self.__reload_state = {}
+			logSys.info("Reload finished.")
 
 	def setIdleJail(self, name, value):
 		self.__jails[name].idle = value
@@ -240,6 +329,12 @@ class Server:
 		return self.__jails[name].idle
 	
 	# Filter
+	def setIgnoreSelf(self, name, value):
+		self.__jails[name].filter.ignoreSelf = _as_bool(value)
+	
+	def getIgnoreSelf(self, name):
+		return self.__jails[name].filter.ignoreSelf
+
 	def addIgnoreIP(self, name, ip):
 		self.__jails[name].filter.addIgnoreIP(ip)
 	
@@ -287,13 +382,11 @@ class Server:
 	
 	def setLogEncoding(self, name, encoding):
 		filter_ = self.__jails[name].filter
-		if isinstance(filter_, FileFilter):
-			filter_.setLogEncoding(encoding)
+		filter_.setLogEncoding(encoding)
 	
 	def getLogEncoding(self, name):
 		filter_ = self.__jails[name].filter
-		if isinstance(filter_, FileFilter):
-			return filter_.getLogEncoding()
+		return filter_.getLogEncoding()
 	
 	def setFindTime(self, name, value):
 		self.__jails[name].filter.setFindTime(value)
@@ -307,23 +400,41 @@ class Server:
 	def getDatePattern(self, name):
 		return self.__jails[name].filter.getDatePattern()
 
+	def setLogTimeZone(self, name, tz):
+		self.__jails[name].filter.setLogTimeZone(tz)
+
+	def getLogTimeZone(self, name):
+		return self.__jails[name].filter.getLogTimeZone()
+
 	def setIgnoreCommand(self, name, value):
-		self.__jails[name].filter.setIgnoreCommand(value)
+		self.__jails[name].filter.ignoreCommand = value
 
 	def getIgnoreCommand(self, name):
-		return self.__jails[name].filter.getIgnoreCommand()
+		return self.__jails[name].filter.ignoreCommand
 
+	def setIgnoreCache(self, name, value):
+		value, options = extractOptions("cache["+value+"]")
+		self.__jails[name].filter.ignoreCache = options
+
+	def getIgnoreCache(self, name):
+		return self.__jails[name].filter.ignoreCache
+
+	def setPrefRegex(self, name, value):
+		flt = self.__jails[name].filter
+		logSys.debug("  prefregex: %r", value)
+		flt.prefRegex = value
+
+	def getPrefRegex(self, name):
+		return self.__jails[name].filter.prefRegex
+	
 	def addFailRegex(self, name, value, multiple=False):
 		flt = self.__jails[name].filter
-		if multiple:
-			for value in value:
-				logSys.debug("  failregex: %r", value)
-				flt.addFailRegex(value)
-		else:
+		if not multiple: value = (value,)
+		for value in value:
 			logSys.debug("  failregex: %r", value)
 			flt.addFailRegex(value)
 	
-	def delFailRegex(self, name, index):
+	def delFailRegex(self, name, index=None):
 		self.__jails[name].filter.delFailRegex(index)
 	
 	def getFailRegex(self, name):
@@ -331,11 +442,8 @@ class Server:
 	
 	def addIgnoreRegex(self, name, value, multiple=False):
 		flt = self.__jails[name].filter
-		if multiple:
-			for value in value:
-				logSys.debug("  ignoreregex: %r", value)
-				flt.addIgnoreRegex(value)
-		else:
+		if not multiple: value = (value,)
+		for value in value:
 			logSys.debug("  ignoreregex: %r", value)
 			flt.addIgnoreRegex(value)
 	
@@ -365,7 +473,9 @@ class Server:
 	
 	# Action
 	def addAction(self, name, value, *args):
-		self.__jails[name].actions.add(value, *args)
+		## create (or reload) jail action:
+		self.__jails[name].actions.add(value, *args, 
+			reload=name in self.__reload_state)
 	
 	def getActions(self, name):
 		return self.__jails[name].actions
@@ -382,8 +492,20 @@ class Server:
 	def setBanIP(self, name, value):
 		return self.__jails[name].filter.addBannedIP(value)
 		
-	def setUnbanIP(self, name, value):
-		self.__jails[name].actions.removeBannedIP(value)
+	def setUnbanIP(self, name=None, value=None):
+		if name is not None:
+			# in all jails:
+			jails = [self.__jails[name]]
+		else:
+			# single jail:
+			jails = self.__jails.values()
+		# unban given or all (if value is None):
+		cnt = 0
+		for jail in jails:
+			cnt += jail.actions.removeBannedIP(value, ifexists=(name is None))
+		if value and not cnt:
+			logSys.info("%s is not banned", value)
+		return cnt
 		
 	def getBanTime(self, name):
 		return self.__jails[name].actions.getBanTime()
@@ -439,11 +561,11 @@ class Server:
 		with self.__loggingLock:
 			if self.__logLevel == value:
 				return
-			try:
-				getLogger("fail2ban").setLevel(getattr(logging, value))
-				self.__logLevel = value
-			except AttributeError:
-				raise ValueError("Invalid log level %r" % value)
+			ll = str2LogLevel(value)
+			# don't change real log-level if running from the test cases:
+			getLogger("fail2ban").setLevel(
+				ll if DEF_LOGTARGET != "INHERITED" or ll < logging.DEBUG else DEF_LOGLEVEL)
+			self.__logLevel = value
 	
 	##
 	# Get the logging level.
@@ -462,20 +584,28 @@ class Server:
 	# @param target the logging target
 	
 	def setLogTarget(self, target):
+		# check reserved targets in uppercase, don't change target, because it can be file:
+		target, logOptions = extractOptions(target)
+		systarget = target.upper()
 		with self.__loggingLock:
 			# don't set new handlers if already the same
 			# or if "INHERITED" (foreground worker of the test cases, to prevent stop logging):
 			if self.__logTarget == target:
 				return True
-			if target == "INHERITED":
+			if systarget == "INHERITED":
 				self.__logTarget = target
 				return True
+			padding = logOptions.get('padding')
 			# set a format which is simpler for console use
-			formatter = logging.Formatter("%(asctime)s %(name)-24s[%(process)d]: %(levelname)-7s %(message)s")
-			if target == "SYSLOG":
-				# Syslog daemons already add date to the message.
-				formatter = logging.Formatter("%(name)s[%(process)d]: %(levelname)s %(message)s")
-				facility = logging.handlers.SysLogHandler.LOG_DAEMON
+			if systarget == "SYSLOG":
+				facility = logOptions.get('facility', 'DAEMON').upper()
+				# backwards compatibility - default no padding for syslog handler:
+				if padding is None: padding = '0'
+				try:
+					facility = getattr(logging.handlers.SysLogHandler, 'LOG_' + facility)
+				except AttributeError: # pragma: no cover
+					logSys.error("Unable to set facility %r, using 'DAEMON'", logOptions.get('facility'))
+					facility = logging.handlers.SysLogHandler.LOG_DAEMON
 				if self.__syslogSocket == "auto":
 					import platform
 					self.__syslogSocket = self.__autoSyslogSocketPaths.get(
@@ -491,9 +621,9 @@ class Server:
 						"Syslog socket file: %s does not exists"
 						" or is not a socket" % self.__syslogSocket)
 					return False
-			elif target == "STDOUT":
+			elif systarget in ("STDOUT", "SYSOUT"):
 				hdlr = logging.StreamHandler(sys.stdout)
-			elif target == "STDERR":
+			elif systarget == "STDERR":
 				hdlr = logging.StreamHandler(sys.stderr)
 			else:
 				# Target should be a file
@@ -501,8 +631,8 @@ class Server:
 					open(target, "a").close()
 					hdlr = logging.handlers.RotatingFileHandler(target)
 				except IOError:
-					logSys.error("Unable to log to " + target)
-					logSys.info("Logging to previous target " + self.__logTarget)
+					logSys.error("Unable to log to %r", target)
+					logSys.info("Logging to previous target %r", self.__logTarget)
 					return False
 			# Removes previous handlers -- in reverse order since removeHandler
 			# alter the list in-place and that can confuses the iterable
@@ -521,8 +651,31 @@ class Server:
 					if (2, 6, 3) <= sys.version_info < (3,) or \
 							(3, 2) <= sys.version_info:
 						raise
+			# detailed format by deep log levels (as DEBUG=10):
+			if logger.getEffectiveLevel() <= logging.DEBUG: # pragma: no cover
+				if self.__verbose is None:
+					self.__verbose = logging.DEBUG - logger.getEffectiveLevel() + 1
+			# If handler don't already add date to the message:
+			addtime = logOptions.get('datetime')
+			if addtime is not None:
+				addtime = _as_bool(addtime)
+			else:
+				addtime = systarget not in ("SYSLOG", "SYSOUT")
+			if padding is not None:
+				padding = _as_bool(padding) 
+			else:
+				padding = True
+			# If log-format is redefined in options:
+			if logOptions.get('format', '') != '':
+				fmt = logOptions.get('format')
+			else:
+				# verbose log-format:
+				verbose = 0
+				if self.__verbose is not None and self.__verbose > 2: # pragma: no cover
+					verbose = self.__verbose-1
+				fmt = getVerbosityFormat(verbose, addtime=addtime, padding=padding)
 			# tell the handler to use this format
-			hdlr.setFormatter(formatter)
+			hdlr.setFormatter(logging.Formatter(fmt))
 			logger.addHandler(hdlr)
 			# Does not display this message at startup.
 			if self.__logTarget is not None:
@@ -548,9 +701,9 @@ class Server:
 			if self.__syslogSocket == syslogsocket:
 				return True
 			self.__syslogSocket = syslogsocket
-			# Conditionally reload, logtarget depends on socket path when SYSLOG
-			return self.__logTarget != "SYSLOG"\
-				   or self.setLogTarget(self.__logTarget)
+		# Conditionally reload, logtarget depends on socket path when SYSLOG
+		return self.__logTarget != "SYSLOG"\
+			   or self.setLogTarget(self.__logTarget)
 
 	def getLogTarget(self):
 		with self.__loggingLock:
@@ -591,7 +744,7 @@ class Server:
 			if Fail2BanDb is not None:
 				self.__db = Fail2BanDb(filename)
 				self.__db.delAllJails()
-			else:
+			else: # pragma: no cover
 				logSys.error(
 					"Unable to import fail2ban database module as sqlite "
 					"is not available.")
@@ -624,7 +777,7 @@ class Server:
 			# the child gets a new PID, making it impossible for its PID to equal its
 			# PGID.
 			pid = os.fork()
-		except OSError, e:
+		except OSError as e:
 			return (False, (e.errno, e.strerror))	 # ERROR (return a tuple)
 		
 		if pid == 0:	   # The first child.
@@ -645,7 +798,7 @@ class Server:
 				# fork guarantees that the child is no longer a session leader, thus
 				# preventing the daemon from ever acquiring a controlling terminal.
 				pid = os.fork()		# Fork a second child.
-			except OSError, e:
+			except OSError as e:
 				return (False, (e.errno, e.strerror))  # ERROR (return a tuple)
 		
 			if (pid == 0):	  # The second child.

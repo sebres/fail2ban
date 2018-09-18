@@ -24,8 +24,8 @@ __license__ = "GPL"
 
 from __builtin__ import open as fopen
 import unittest
-import getpass
 import os
+import re
 import sys
 import time, datetime
 import tempfile
@@ -38,12 +38,13 @@ except ImportError:
 
 from ..server.jail import Jail
 from ..server.filterpoll import FilterPoll
-from ..server.filter import Filter, FileFilter, FileContainer
+from ..server.filter import FailTicket, Filter, FileFilter, FileContainer
 from ..server.failmanager import FailManagerEmpty
 from ..server.ipdns import DNSUtils, IPAddr
 from ..server.mytime import MyTime
-from ..server.utils import Utils
-from .utils import setUpMyTime, tearDownMyTime, mtimesleep, LogCaptureTestCase
+from ..server.utils import Utils, uni_decode
+from .utils import setUpMyTime, tearDownMyTime, mtimesleep, with_tmpdir, LogCaptureTestCase, \
+	logSys as DefLogSys, CONFIG_DIR as STOCK_CONF_DIR
 from .dummyjail import DummyJail
 
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
@@ -82,10 +83,7 @@ def _killfile(f, name):
 		_killfile(None, name + '.bak')
 
 
-def _maxWaitTime(wtime):
-	if unittest.F2B.fast:
-		wtime /= 10
-	return wtime
+_maxWaitTime = unittest.F2B.maxWaitTime
 
 
 class _tmSerial():
@@ -225,10 +223,14 @@ def _copy_lines_between_files(in_, fout, n=None, skip=0, mode='a', terminal_line
 		# Opened earlier, therefore must close it
 		fin.close()
 	# to give other threads possibly some time to crunch
-	time.sleep(Utils.DEFAULT_SLEEP_INTERVAL)
+	time.sleep(Utils.DEFAULT_SHORT_INTERVAL)
 	return fout
 
 
+TEST_JOURNAL_FIELDS = {
+  "SYSLOG_IDENTIFIER": "fail2ban-testcases",
+	"PRIORITY": "7",
+}
 def _copy_lines_to_journal(in_, fields={},n=None, skip=0, terminal_line=""): # pragma: systemd no cover
 	"""Copy lines from one file to systemd journal
 
@@ -239,9 +241,7 @@ def _copy_lines_to_journal(in_, fields={},n=None, skip=0, terminal_line=""): # p
 	else:
 		fin = in_
 	# Required for filtering
-	fields.update({"SYSLOG_IDENTIFIER": "fail2ban-testcases",
-					"PRIORITY": "7",
-					})
+	fields.update(TEST_JOURNAL_FIELDS)
 	# Skip
 	for i in xrange(skip):
 		fin.readline()
@@ -265,6 +265,7 @@ def _copy_lines_to_journal(in_, fields={},n=None, skip=0, terminal_line=""): # p
 class BasicFilter(unittest.TestCase):
 
 	def setUp(self):
+		super(BasicFilter, self).setUp()
 		self.filter = Filter('name')
 
 	def testGetSetUseDNS(self):
@@ -278,10 +279,20 @@ class BasicFilter(unittest.TestCase):
 	def testGetSetDatePattern(self):
 		self.assertEqual(self.filter.getDatePattern(),
 			(None, "Default Detectors"))
-		self.filter.setDatePattern("^%Y-%m-%d-%H%M%S.%f %z")
+		self.filter.setDatePattern("^%Y-%m-%d-%H%M%S.%f %z **")
 		self.assertEqual(self.filter.getDatePattern(),
-			("^%Y-%m-%d-%H%M%S.%f %z",
-			"^Year-Month-Day-24hourMinuteSecond.Microseconds Zone offset"))
+			("^%Y-%m-%d-%H%M%S.%f %z **",
+			"^Year-Month-Day-24hourMinuteSecond.Microseconds Zone offset **"))
+
+	def testGetSetLogTimeZone(self):
+		self.assertEqual(self.filter.getLogTimeZone(), None)
+		self.filter.setLogTimeZone('UTC')
+		self.assertEqual(self.filter.getLogTimeZone(), 'UTC')
+		self.filter.setLogTimeZone('UTC-0400')
+		self.assertEqual(self.filter.getLogTimeZone(), 'UTC-0400')
+		self.filter.setLogTimeZone('UTC+0200')
+		self.assertEqual(self.filter.getLogTimeZone(), 'UTC+0200')
+		self.assertRaises(ValueError, self.filter.setLogTimeZone, 'not-a-time-zone')
 
 	def testAssertWrongTime(self):
 		self.assertRaises(AssertionError, 
@@ -296,8 +307,20 @@ class BasicFilter(unittest.TestCase):
 		## test function "_tm" works correct (returns the same as slow strftime):
 		for i in xrange(1417512352, (1417512352 // 3600 + 3) * 3600):
 			tm = datetime.datetime.fromtimestamp(i).strftime("%Y-%m-%d %H:%M:%S")
-			if _tm(i) != tm:
+			if _tm(i) != tm: # pragma: no cover - never reachable
 				self.assertEqual((_tm(i), i), (tm, i))
+
+	def testWrongCharInTupleLine(self):
+		## line tuple has different types (ascii after ascii / unicode):
+		for a1 in ('', u'', b''):
+			for a2 in ('2016-09-05T20:18:56', u'2016-09-05T20:18:56', b'2016-09-05T20:18:56'):
+				for a3 in (
+					'Fail for "g\xc3\xb6ran" from 192.0.2.1', 
+					u'Fail for "g\xc3\xb6ran" from 192.0.2.1',
+					b'Fail for "g\xc3\xb6ran" from 192.0.2.1'
+				):
+					# join should work if all arguments have the same type:
+					"".join([uni_decode(v) for v in (a1, a2, a3)])
 
 
 class IgnoreIP(LogCaptureTestCase):
@@ -307,18 +330,38 @@ class IgnoreIP(LogCaptureTestCase):
 		LogCaptureTestCase.setUp(self)
 		self.jail = DummyJail()
 		self.filter = FileFilter(self.jail)
+		self.filter.ignoreSelf = False
+
+	def testIgnoreSelfIP(self):
+		ipList = ("127.0.0.1",)
+		# test ignoreSelf is false:
+		for ip in ipList:
+			self.assertFalse(self.filter.inIgnoreIPList(ip))
+			self.assertNotLogged("[%s] Ignore %s by %s" % (self.jail.name, ip, "ignoreself rule"))
+		# test ignoreSelf with true:
+		self.filter.ignoreSelf = True
+		self.pruneLog()
+		for ip in ipList:
+			self.assertTrue(self.filter.inIgnoreIPList(ip))
+			self.assertLogged("[%s] Ignore %s by %s" % (self.jail.name, ip, "ignoreself rule"))
 
 	def testIgnoreIPOK(self):
 		ipList = "127.0.0.1", "192.168.0.1", "255.255.255.255", "99.99.99.99"
 		for ip in ipList:
 			self.filter.addIgnoreIP(ip)
 			self.assertTrue(self.filter.inIgnoreIPList(ip))
+			self.assertLogged("[%s] Ignore %s by %s" % (self.jail.name, ip, "ip"))
 
 	def testIgnoreIPNOK(self):
 		ipList = "", "999.999.999.999", "abcdef.abcdef", "192.168.0."
 		for ip in ipList:
 			self.filter.addIgnoreIP(ip)
 			self.assertFalse(self.filter.inIgnoreIPList(ip))
+		if not unittest.F2B.no_network: # pragma: no cover
+			self.assertLogged(
+				'Unable to find a corresponding IP address for 999.999.999.999',
+				'Unable to find a corresponding IP address for abcdef.abcdef',
+				'Unable to find a corresponding IP address for 192.168.0.', all=True)
 
 	def testIgnoreIPCIDR(self):
 		self.filter.addIgnoreIP('192.168.1.0/25')
@@ -346,6 +389,7 @@ class IgnoreIP(LogCaptureTestCase):
 		setUpMyTime()
 		self.filter.addIgnoreIP('192.168.1.0/25')
 		self.filter.addFailRegex('<HOST>')
+		self.filter.setDatePattern('{^LN-BEG}EPOCH')
 		self.filter.processLineAndAdd('1387203300.222 192.168.1.32')
 		self.assertLogged('Ignore 192.168.1.32')
 		tearDownMyTime()
@@ -357,9 +401,67 @@ class IgnoreIP(LogCaptureTestCase):
 		self.assertLogged('Requested to manually ban an ignored IP 192.168.1.32. User knows best. Proceeding to ban it.')
 
 	def testIgnoreCommand(self):
-		self.filter.setIgnoreCommand(sys.executable + ' ' + os.path.join(TEST_FILES_DIR, "ignorecommand.py <ip>"))
+		self.filter.ignoreCommand = sys.executable + ' ' + os.path.join(TEST_FILES_DIR, "ignorecommand.py <ip>")
 		self.assertTrue(self.filter.inIgnoreIPList("10.0.0.1"))
 		self.assertFalse(self.filter.inIgnoreIPList("10.0.0.0"))
+		self.assertLogged("returned successfully 0", "returned successfully 1", all=True)
+		self.pruneLog()
+		self.assertFalse(self.filter.inIgnoreIPList(""))
+		self.assertLogged("usage: ignorecommand IP", "returned 10", all=True)
+	
+	def testIgnoreCommandForTicket(self):
+		# by host of IP (2001:db8::1 and 2001:db8::ffff map to "test-host" and "test-other" in the test-suite):
+		self.filter.ignoreCommand = 'if [ "<ip-host>" = "test-host" ]; then exit 0; fi; exit 1'
+		self.pruneLog()
+		self.assertTrue(self.filter.inIgnoreIPList(FailTicket("2001:db8::1")))
+		self.assertLogged("returned successfully 0")
+		self.pruneLog()
+		self.assertFalse(self.filter.inIgnoreIPList(FailTicket("2001:db8::ffff")))
+		self.assertLogged("returned successfully 1")
+		# by user-name (ignore tester):
+		self.filter.ignoreCommand = 'if [ "<F-USER>" = "tester" ]; then exit 0; fi; exit 1'
+		self.pruneLog()
+		self.assertTrue(self.filter.inIgnoreIPList(FailTicket("tester", data={'user': 'tester'})))
+		self.assertLogged("returned successfully 0")
+		self.pruneLog()
+		self.assertFalse(self.filter.inIgnoreIPList(FailTicket("root", data={'user': 'root'})))
+		self.assertLogged("returned successfully 1", all=True)
+
+	def testIgnoreCache(self):
+		# like both test-cases above, just cached (so once per key)...
+		self.filter.ignoreCache = {"key":"<ip>"}
+		self.filter.ignoreCommand = 'if [ "<ip>" = "10.0.0.1" ]; then exit 0; fi; exit 1'
+		for i in xrange(5):
+			self.pruneLog()
+			self.assertTrue(self.filter.inIgnoreIPList("10.0.0.1"))
+			self.assertFalse(self.filter.inIgnoreIPList("10.0.0.0"))
+			if not i:
+				self.assertLogged("returned successfully 0", "returned successfully 1", all=True)
+			else:
+				self.assertNotLogged("returned successfully 0", "returned successfully 1", all=True)
+		# by host of IP:
+		self.filter.ignoreCache = {"key":"<ip-host>"}
+		self.filter.ignoreCommand = 'if [ "<ip-host>" = "test-host" ]; then exit 0; fi; exit 1'
+		for i in xrange(5):
+			self.pruneLog()
+			self.assertTrue(self.filter.inIgnoreIPList(FailTicket("2001:db8::1")))
+			self.assertFalse(self.filter.inIgnoreIPList(FailTicket("2001:db8::ffff")))
+			if not i:
+				self.assertLogged("returned successfully")
+			else:
+				self.assertNotLogged("returned successfully")
+		# by user-name:
+		self.filter.ignoreCache = {"key":"<F-USER>", "max-count":"10", "max-time":"1h"}
+		self.assertEqual(self.filter.ignoreCache, ["<F-USER>", 10, 60*60])
+		self.filter.ignoreCommand = 'if [ "<F-USER>" = "tester" ]; then exit 0; fi; exit 1'
+		for i in xrange(5):
+			self.pruneLog()
+			self.assertTrue(self.filter.inIgnoreIPList(FailTicket("tester", data={'user': 'tester'})))
+			self.assertFalse(self.filter.inIgnoreIPList(FailTicket("root", data={'user': 'root'})))
+			if not i:
+				self.assertLogged("returned successfully")
+			else:
+				self.assertNotLogged("returned successfully")
 
 	def testIgnoreCauseOK(self):
 		ip = "93.184.216.34"
@@ -381,19 +483,61 @@ class IgnoreIPDNS(LogCaptureTestCase):
 		self.jail = DummyJail()
 		self.filter = FileFilter(self.jail)
 
-	def testIgnoreIPDNSOK(self):
-		self.filter.addIgnoreIP("www.epfl.ch")
-		self.assertTrue(self.filter.inIgnoreIPList("128.178.50.12"))
-		self.filter.addIgnoreIP("example.com")
-		self.assertTrue(self.filter.inIgnoreIPList("93.184.216.34"))
-		self.assertTrue(self.filter.inIgnoreIPList("2606:2800:220:1:248:1893:25c8:1946"))
+	def testIgnoreIPDNS(self):
+		for dns in ("www.epfl.ch", "example.com"):
+			self.filter.addIgnoreIP(dns)
+			ips = DNSUtils.dnsToIp(dns)
+			self.assertTrue(len(ips) > 0)
+			# for each ip from dns check ip ignored:
+			for ip in ips:
+				ip = str(ip)
+				DefLogSys.debug('  ++ positive case for %s', ip)
+				self.assertTrue(self.filter.inIgnoreIPList(ip))
+				# check another ips (with increment/decrement of first/last part) not ignored:
+				iparr = []
+				ip2 = re.search(r'^([^.:]+)([.:])(.*?)([.:])([^.:]+)$', ip)
+				if ip2:
+					ip2 = ip2.groups()
+					for o in (0, 4):
+						for i in (1, -1):
+							ipo = list(ip2)
+							if ipo[1] == '.':
+								ipo[o] = str(int(ipo[o])+i)
+							else:
+								ipo[o] = '%x' % (int(ipo[o], 16)+i)
+							ipo = ''.join(ipo)
+							if ipo not in ips:
+								iparr.append(ipo)
+				self.assertTrue(len(iparr) > 0)
+				for ip in iparr:
+					DefLogSys.debug('  -- negative case for %s', ip)
+					self.assertFalse(self.filter.inIgnoreIPList(str(ip)))
 
-	def testIgnoreIPDNSNOK(self):
-		# Test DNS
-		self.filter.addIgnoreIP("www.epfl.ch")
-		self.assertFalse(self.filter.inIgnoreIPList("127.177.50.10"))
-		self.assertFalse(self.filter.inIgnoreIPList("128.178.50.11"))
-		self.assertFalse(self.filter.inIgnoreIPList("128.178.50.13"))
+	def testIgnoreCmdApacheFakegooglebot(self):
+		unittest.F2B.SkipIfCfgMissing(stock=True)
+		cmd = os.path.join(STOCK_CONF_DIR, "filter.d/ignorecommands/apache-fakegooglebot")
+		## below test direct as python module:
+		mod = Utils.load_python_module(cmd)
+		self.assertFalse(mod.is_googlebot(mod.process_args([cmd, "128.178.222.69"])))
+		self.assertFalse(mod.is_googlebot(mod.process_args([cmd, "192.0.2.1"])))
+		bot_ips = ['66.249.66.1']
+		for ip in bot_ips:
+			self.assertTrue(mod.is_googlebot(mod.process_args([cmd, str(ip)])), "test of googlebot ip %s failed" % ip)
+		self.assertRaises(ValueError, lambda: mod.is_googlebot(mod.process_args([cmd])))
+		self.assertRaises(ValueError, lambda: mod.is_googlebot(mod.process_args([cmd, "192.0"])))
+		## via command:
+		self.filter.ignoreCommand = cmd + " <ip>"
+		for ip in bot_ips:
+			self.assertTrue(self.filter.inIgnoreIPList(str(ip)), "test of googlebot ip %s failed" % ip)
+			self.assertLogged('-- returned successfully')
+			self.pruneLog()
+		self.assertFalse(self.filter.inIgnoreIPList("192.0"))
+		self.assertLogged('Argument must be a single valid IP.')
+		self.pruneLog()
+		self.filter.ignoreCommand = cmd + " bad arguments <ip>"
+		self.assertFalse(self.filter.inIgnoreIPList("192.0"))
+		self.assertLogged('Please provide a single IP as an argument.')
+
 
 
 class LogFile(LogCaptureTestCase):
@@ -417,12 +561,13 @@ class LogFileFilterPoll(unittest.TestCase):
 
 	def setUp(self):
 		"""Call before every test case."""
+		super(LogFileFilterPoll, self).setUp()
 		self.filter = FilterPoll(DummyJail())
 		self.filter.addLogPath(LogFileFilterPoll.FILENAME)
 
 	def tearDown(self):
 		"""Call after every test case."""
-		pass
+		super(LogFileFilterPoll, self).tearDown()
 
 	#def testOpen(self):
 	#	self.filter.openLogFile(LogFile.FILENAME)
@@ -432,6 +577,8 @@ class LogFileFilterPoll(unittest.TestCase):
 		self.assertFalse(self.filter.isModified(LogFileFilterPoll.FILENAME))
 
 	def testSeekToTimeSmallFile(self):
+		# speedup search using exact date pattern:
+		self.filter.setDatePattern('^%ExY-%Exm-%Exd %ExH:%ExM:%ExS')
 		fname = tempfile.mktemp(prefix='tmp_fail2ban', suffix='.log')
 		time = 1417512352
 		f = open(fname, 'w')
@@ -516,6 +663,8 @@ class LogFileFilterPoll(unittest.TestCase):
 			_killfile(f, fname)
 
 	def testSeekToTimeLargeFile(self):
+		# speedup search using exact date pattern:
+		self.filter.setDatePattern('^%ExY-%Exm-%Exd %ExH:%ExM:%ExS')
 		fname = tempfile.mktemp(prefix='tmp_fail2ban', suffix='.log')
 		time = 1417512352
 		f = open(fname, 'w')
@@ -580,12 +729,12 @@ class LogFileMonitor(LogCaptureTestCase):
 		_killfile(self.file, self.name)
 		pass
 
-	def isModified(self, delay=2.):
+	def isModified(self, delay=2):
 		"""Wait up to `delay` sec to assure that it was modified or not
 		"""
 		return Utils.wait_for(lambda: self.filter.isModified(self.name), _maxWaitTime(delay))
 
-	def notModified(self, delay=2.):
+	def notModified(self, delay=2):
 		"""Wait up to `delay` sec as long as it was not modified
 		"""
 		return Utils.wait_for(lambda: not self.filter.isModified(self.name), _maxWaitTime(delay))
@@ -594,7 +743,15 @@ class LogFileMonitor(LogCaptureTestCase):
 		os.chmod(self.name, 0)
 		self.filter.getFailures(self.name)
 		failure_was_logged = self._is_logged('Unable to open %s' % self.name)
-		is_root = getpass.getuser() == 'root'
+		# verify that we cannot access the file. Checking by name of user is not
+		# sufficient since could be a fakeroot or some other super-user
+		is_root = True
+		try:
+			with open(self.name) as f: # pragma: no cover - normally no root
+				f.read()
+		except IOError:
+			is_root = False
+
 		# If ran as root, those restrictive permissions would not
 		# forbid log to be read.
 		self.assertTrue(failure_was_logged != is_root)
@@ -603,6 +760,30 @@ class LogFileMonitor(LogCaptureTestCase):
 		_killfile(self.file, self.name)
 		self.filter.getFailures(self.name)
 		self.assertLogged('Unable to open %s' % self.name)
+
+	def testErrorProcessLine(self):
+		# speedup search using exact date pattern:
+		self.filter.setDatePattern('^%ExY-%Exm-%Exd %ExH:%ExM:%ExS')
+		self.filter.sleeptime /= 1000.0
+		## produce error with not callable processLine:
+		_org_processLine = self.filter.processLine
+		self.filter.processLine = None
+		for i in range(100):
+			self.file.write("line%d\n" % 1)
+		self.file.flush()
+		for i in range(100):
+			self.filter.getFailures(self.name)
+		self.assertLogged('Failed to process line:')
+		self.assertLogged('Too many errors at once')
+		self.pruneLog()
+		self.assertTrue(self.filter.idle)
+		self.filter.idle = False
+		self.filter.getFailures(self.name)
+		self.filter.processLine = _org_processLine
+		self.file.write("line%d\n" % 1)
+		self.file.flush()
+		self.filter.getFailures(self.name)
+		self.assertNotLogged('Failed to process line:')
 
 	def testRemovingFailRegex(self):
 		self.filter.delFailRegex(0)
@@ -645,6 +826,8 @@ class LogFileMonitor(LogCaptureTestCase):
 		pass
 
 	def testNewChangeViaGetFailures_simple(self):
+		# speedup search using exact date pattern:
+		self.filter.setDatePattern('^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?')
 		# suck in lines from this sample log file
 		self.filter.getFailures(self.name)
 		self.assertRaises(FailManagerEmpty, self.filter.failManager.toBan)
@@ -660,6 +843,8 @@ class LogFileMonitor(LogCaptureTestCase):
 		_assert_correct_last_attempt(self, self.filter, GetFailures.FAILURES_01)
 
 	def testNewChangeViaGetFailures_rewrite(self):
+		# speedup search using exact date pattern:
+		self.filter.setDatePattern('^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?')
 		#
 		# if we rewrite the file at once
 		self.file.close()
@@ -678,6 +863,8 @@ class LogFileMonitor(LogCaptureTestCase):
 		_assert_correct_last_attempt(self, self.filter, GetFailures.FAILURES_01)
 
 	def testNewChangeViaGetFailures_move(self):
+		# speedup search using exact date pattern:
+		self.filter.setDatePattern('^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?')
 		#
 		# if we move file into a new location while it has been open already
 		self.file.close()
@@ -695,19 +882,53 @@ class LogFileMonitor(LogCaptureTestCase):
 		self.assertEqual(self.filter.failManager.getFailTotal(), 3)
 
 
+class CommonMonitorTestCase(unittest.TestCase):
+
+	def setUp(self):
+		"""Call before every test case."""
+		super(CommonMonitorTestCase, self).setUp()
+		self._failTotal = 0
+
+	def waitFailTotal(self, count, delay=1):
+		"""Wait up to `delay` sec to assure that expected failure `count` reached
+		"""
+		ret = Utils.wait_for(
+			lambda: self.filter.failManager.getFailTotal() >= (self._failTotal + count) and self.jail.isFilled(),
+			_maxWaitTime(delay))
+		self._failTotal += count
+		return ret
+
+	def isFilled(self, delay=1):
+		"""Wait up to `delay` sec to assure that it was modified or not
+		"""
+		return Utils.wait_for(self.jail.isFilled, _maxWaitTime(delay))
+
+	def isEmpty(self, delay=5):
+		"""Wait up to `delay` sec to assure that it empty again
+		"""
+		return Utils.wait_for(self.jail.isEmpty, _maxWaitTime(delay))
+
+	def waitForTicks(self, ticks, delay=2):
+		"""Wait up to `delay` sec to assure that it was modified or not
+		"""
+		last_ticks = self.filter.ticks
+		return Utils.wait_for(lambda: self.filter.ticks >= last_ticks + ticks, _maxWaitTime(delay))
+
+
 def get_monitor_failures_testcase(Filter_):
 	"""Generator of TestCase's for different filters/backends
 	"""
 
 	# add Filter_'s name so we could easily identify bad cows
 	testclass_name = tempfile.mktemp(
-		'fail2ban', 'monitorfailures_%s' % (Filter_.__name__,))
+		'fail2ban', 'monitorfailures_%s_' % (Filter_.__name__,))
 
-	class MonitorFailures(unittest.TestCase):
+	class MonitorFailures(CommonMonitorTestCase):
 		count = 0
 
 		def setUp(self):
 			"""Call before every test case."""
+			super(MonitorFailures, self).setUp()
 			setUpMyTime()
 			self.filter = self.name = 'NA'
 			self.name = '%s-%d' % (testclass_name, self.count)
@@ -716,6 +937,8 @@ def get_monitor_failures_testcase(Filter_):
 			self.jail = DummyJail()
 			self.filter = Filter_(self.jail)
 			self.filter.addLogPath(self.name, autoSeek=False)
+			# speedup search using exact date pattern:
+			self.filter.setDatePattern('^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?')
 			self.filter.active = True
 			self.filter.addFailRegex("(?:(?:Authentication failure|Failed [-/\w+]+) for(?: [iI](?:llegal|nvalid) user)?|[Ii](?:llegal|nvalid) user|ROOT LOGIN REFUSED) .*(?: from|FROM) <HOST>")
 			self.filter.start()
@@ -735,12 +958,7 @@ def get_monitor_failures_testcase(Filter_):
 			#print "D: KILLING THE FILE"
 			_killfile(self.file, self.name)
 			#time.sleep(0.2)			  # Give FS time to ack the removal
-			pass
-
-		def isFilled(self, delay=1.):
-			"""Wait up to `delay` sec to assure that it was modified or not
-			"""
-			return Utils.wait_for(self.jail.isFilled, _maxWaitTime(delay))
+			super(MonitorFailures, self).tearDown()
 
 		def _sleep_4_poll(self):
 			# Since FilterPoll relies on time stamps and some
@@ -749,15 +967,21 @@ def get_monitor_failures_testcase(Filter_):
 			if isinstance(self.filter, FilterPoll):
 				Utils.wait_for(self.filter.isAlive, _maxWaitTime(5))
 
-		def isEmpty(self, delay=_maxWaitTime(5)):
-			# shorter wait time for not modified status
-			return Utils.wait_for(self.jail.isEmpty, _maxWaitTime(delay))
-
 		def assert_correct_last_attempt(self, failures, count=None):
-			self.assertTrue(self.isFilled(10)) # give Filter a chance to react
+			self.assertTrue(self.waitFailTotal(count if count else failures[1], 10))
 			_assert_correct_last_attempt(self, self.jail, failures, count=count)
 
 		def test_grow_file(self):
+			self._test_grow_file()
+
+		def test_grow_file_in_idle(self):
+			self._test_grow_file(True)
+
+		def _test_grow_file(self, idle=False):
+			if idle:
+				self.filter.sleeptime /= 100.0
+				self.filter.idle = True
+				self.waitForTicks(1)
 			# suck in lines from this sample log file
 			self.assertRaises(FailManagerEmpty, self.filter.failManager.toBan)
 
@@ -769,8 +993,12 @@ def get_monitor_failures_testcase(Filter_):
 			# since it should have not been enough
 
 			_copy_lines_between_files(GetFailures.FILENAME_01, self.file, skip=5)
+			if idle:
+				self.waitForTicks(1)
+				self.assertTrue(self.isEmpty(1))
+				return
 			self.assertTrue(self.isFilled(10))
-			# so we sleep for up to 2 sec for it not to become empty,
+			# so we sleep a bit for it not to become empty,
 			# and meanwhile pass to other thread(s) and filter should
 			# have gathered new failures and passed them into the
 			# DummyJail
@@ -800,18 +1028,21 @@ def get_monitor_failures_testcase(Filter_):
 												  skip=3, mode='w')
 			self.assert_correct_last_attempt(GetFailures.FAILURES_01)
 
-		def test_move_file(self):
-			# if we move file into a new location while it has been open already
-			self.file.close()
-			self.file = _copy_lines_between_files(GetFailures.FILENAME_01, self.name,
-												  n=14, mode='w')
+		def _wait4failures(self, count=2):
 			# Poll might need more time
 			self.assertTrue(self.isEmpty(_maxWaitTime(5)),
 							"Queue must be empty but it is not: %s."
 							% (', '.join([str(x) for x in self.jail.queue])))
 			self.assertRaises(FailManagerEmpty, self.filter.failManager.toBan)
-			Utils.wait_for(lambda: self.filter.failManager.getFailTotal() == 2, _maxWaitTime(10))
-			self.assertEqual(self.filter.failManager.getFailTotal(), 2)
+			Utils.wait_for(lambda: self.filter.failManager.getFailTotal() >= count, _maxWaitTime(10))
+			self.assertEqual(self.filter.failManager.getFailTotal(), count)
+
+		def test_move_file(self):
+			# if we move file into a new location while it has been open already
+			self.file.close()
+			self.file = _copy_lines_between_files(GetFailures.FILENAME_01, self.name,
+												  n=14, mode='w')
+			self._wait4failures()
 
 			# move aside, but leaving the handle still open...
 			os.rename(self.name, self.name + '.bak')
@@ -825,6 +1056,76 @@ def get_monitor_failures_testcase(Filter_):
 			self.assert_correct_last_attempt(GetFailures.FAILURES_01)
 			self.assertEqual(self.filter.failManager.getFailTotal(), 6)
 
+		def test_pyinotify_delWatch(self):
+			if hasattr(self.filter, '_delWatch'): # pyinotify only
+				m = self.filter._FilterPyinotify__monitor
+				# remove existing watch:
+				self.assertTrue(self.filter._delWatch(m.get_wd(self.name)))
+				# mockup get_path to allow once find path for invalid wd-value:
+				_org_get_path = m.get_path
+				def _get_path(wd):
+					#m.get_path = _org_get_path
+					return 'test'
+				m.get_path = _get_path
+				# try remove watch using definitely not existing handle:
+				self.assertFalse(self.filter._delWatch(0x7fffffff))
+				m.get_path = _org_get_path
+
+		def test_del_file(self):
+			# test filter reaction by delete watching file:
+			self.file.close()
+			self.waitForTicks(1)
+			# remove file (cause detection of log-rotation)...
+			os.unlink(self.name)
+			# check it was detected (in pending files):
+			self.waitForTicks(2)
+			if hasattr(self.filter, "getPendingPaths"):
+				self.assertTrue(Utils.wait_for(lambda: self.name in self.filter.getPendingPaths(), _maxWaitTime(10)))
+				self.assertEqual(len(self.filter.getPendingPaths()), 1)
+
+		@with_tmpdir
+		def test_move_dir(self, tmp):
+			self.file.close()
+			self.filter.setMaxRetry(10)
+			self.filter.delLogPath(self.name)
+			_killfile(None, self.name)
+			# if we rename parent dir into a new location (simulate directory-base log rotation)
+			tmpsub1 = os.path.join(tmp, "1")
+			tmpsub2 = os.path.join(tmp, "2")
+			os.mkdir(tmpsub1)
+			self.name = os.path.join(tmpsub1, os.path.basename(self.name))
+			os.close(os.open(self.name, os.O_CREAT|os.O_APPEND)); # create empty file
+			self.filter.addLogPath(self.name, autoSeek=False)
+			
+			self.file = _copy_lines_between_files(GetFailures.FILENAME_01, self.name,
+												  skip=12, n=1, mode='w')
+			self.file.close()
+			self._wait4failures(1)
+
+			# rotate whole directory: rename directory 1 as 2a:
+			os.rename(tmpsub1, tmpsub2 + 'a')
+			os.mkdir(tmpsub1)
+			self.file = _copy_lines_between_files(GetFailures.FILENAME_01, self.name,
+												  skip=12, n=1, mode='w')
+			self.file.close()
+			self._wait4failures(2)
+
+			# rotate whole directory: rename directory 1 as 2b:
+			os.rename(tmpsub1, tmpsub2 + 'b')
+			# wait a bit in-between (try to increase coverage, should find pending file for pending dir):
+			self.waitForTicks(2)
+			os.mkdir(tmpsub1)
+			self.waitForTicks(2)
+			self.file = _copy_lines_between_files(GetFailures.FILENAME_01, self.name,
+												  skip=12, n=1, mode='w')
+			self.file.close()
+			self._wait4failures(3)
+
+			# stop before tmpdir deleted (just prevents many monitor events)
+			self.filter.stop()
+			self.filter.join()
+
+
 		def _test_move_into_file(self, interim_kill=False):
 			# if we move a new file into the location of an old (monitored) file
 			_copy_lines_between_files(GetFailures.FILENAME_01, self.name,
@@ -835,7 +1136,7 @@ def get_monitor_failures_testcase(Filter_):
 
 			if interim_kill:
 				_killfile(None, self.name)
-				time.sleep(Utils.DEFAULT_SLEEP_INTERVAL)				  # let them know
+				time.sleep(Utils.DEFAULT_SHORT_INTERVAL)				  # let them know
 
 			# now create a new one to override old one
 			_copy_lines_between_files(GetFailures.FILENAME_01, self.name + '.new',
@@ -879,13 +1180,17 @@ def get_monitor_failures_testcase(Filter_):
 
 			# and now remove the LogPath
 			self.filter.delLogPath(self.name)
+			# wait a bit for filter (backend-threads):
+			self.waitForTicks(2)
 
 			_copy_lines_between_files(GetFailures.FILENAME_01, self.file, n=100)
 			# so we should get no more failures detected
-			self.assertTrue(self.isEmpty(_maxWaitTime(10)))
+			self.assertTrue(self.isEmpty(10))
 
 			# but then if we add it back again (no seek to time in FileFilter's, because in file used the same time)
 			self.filter.addLogPath(self.name, autoSeek=False)
+			# wait a bit for filter (backend-threads):
+			self.waitForTicks(2)
 			# Tricky catch here is that it should get them from the
 			# tail written before, so let's not copy anything yet
 			#_copy_lines_between_files(GetFailures.FILENAME_01, self.name, n=100)
@@ -894,28 +1199,41 @@ def get_monitor_failures_testcase(Filter_):
 
 			# now copy and get even more
 			_copy_lines_between_files(GetFailures.FILENAME_01, self.file, n=100)
-			# yoh: not sure why count here is not 9... TODO
-			self.assert_correct_last_attempt(GetFailures.FAILURES_01)#, count=9)
+      # check for 3 failures (not 9), because 6 already get above...
+			self.assert_correct_last_attempt(GetFailures.FAILURES_01)
+			# total count in this test:
+			self.assertEqual(self.filter.failManager.getFailTotal(), 12)
 
-	MonitorFailures.__name__ = "MonitorFailures<%s>(%s)" \
+	cls = MonitorFailures
+	cls.__qualname__ = cls.__name__ = "MonitorFailures<%s>(%s)" \
 			  % (Filter_.__name__, testclass_name) # 'tempfile')
-	return MonitorFailures
+	return cls
 
 
 def get_monitor_failures_journal_testcase(Filter_): # pragma: systemd no cover
 	"""Generator of TestCase's for journal based filters/backends
 	"""
+	
+	testclass_name = "monitorjournalfailures_%s" % (Filter_.__name__,)
 
-	class MonitorJournalFailures(unittest.TestCase):
+	class MonitorJournalFailures(CommonMonitorTestCase):
 		def setUp(self):
 			"""Call before every test case."""
+			super(MonitorJournalFailures, self).setUp()
+			self._runtimeJournal = None
 			self.test_file = os.path.join(TEST_FILES_DIR, "testcase-journal.log")
 			self.jail = DummyJail()
-			self.filter = Filter_(self.jail)
+			self.filter = None
 			# UUID used to ensure that only meeages generated
 			# as part of this test are picked up by the filter
 			self.test_uuid = str(uuid.uuid4())
-			self.name = "monitorjournalfailures-%s" % self.test_uuid
+			self.name = "%s-%s" % (testclass_name, self.test_uuid)
+			self.journal_fields = {
+				'TEST_FIELD': "1", 'TEST_UUID': self.test_uuid}
+
+		def _initFilter(self, **kwargs):
+			self._getRuntimeJournal() # check journal available
+			self.filter = Filter_(self.jail, **kwargs)
 			self.filter.addJournalMatch([
 				"SYSLOG_IDENTIFIER=fail2ban-testcases",
 				"TEST_FIELD=1",
@@ -924,33 +1242,63 @@ def get_monitor_failures_journal_testcase(Filter_): # pragma: systemd no cover
 				"SYSLOG_IDENTIFIER=fail2ban-testcases",
 				"TEST_FIELD=2",
 				"TEST_UUID=%s" % self.test_uuid])
-			self.journal_fields = {
-				'TEST_FIELD': "1", 'TEST_UUID': self.test_uuid}
-			self.filter.active = True
 			self.filter.addFailRegex("(?:(?:Authentication failure|Failed [-/\w+]+) for(?: [iI](?:llegal|nvalid) user)?|[Ii](?:llegal|nvalid) user|ROOT LOGIN REFUSED) .*(?: from|FROM) <HOST>")
-			self.filter.start()
 
 		def tearDown(self):
-			self.filter.stop()
-			self.filter.join()		  # wait for the thread to terminate
-			pass
+			if self.filter and self.filter.active:
+				self.filter.stop()
+				self.filter.join()		  # wait for the thread to terminate
+			super(MonitorJournalFailures, self).tearDown()
 
-		def __str__(self):
-			return "MonitorJournalFailures%s(%s)" \
-			  % (Filter_, hasattr(self, 'name') and self.name or 'tempfile')
+		def _getRuntimeJournal(self):
+			"""Retrieve current system journal path
 
-		def isFilled(self, delay=1.):
-			"""Wait up to `delay` sec to assure that it was modified or not
+			If not found, SkipTest exception will be raised.
 			"""
-			return Utils.wait_for(self.jail.isFilled, _maxWaitTime(delay))
+			# we can cache it:
+			if self._runtimeJournal is None:
+				# Depending on the system, it could be found under /run or /var/log (e.g. Debian)
+				# which are pointed by different systemd-path variables.  We will
+				# check one at at time until the first hit
+				for systemd_var in 'system-runtime-logs', 'system-state-logs':
+					tmp = Utils.executeCmd(
+						'find "$(systemd-path %s)" -name system.journal' % systemd_var,
+						timeout=10, shell=True, output=True
+					)
+					self.assertTrue(tmp)
+					out = str(tmp[1].decode('utf-8')).split('\n')[0]
+					if out: break
+				self._runtimeJournal = out
+			if self._runtimeJournal:
+				return self._runtimeJournal
+			raise unittest.SkipTest('systemd journal seems to be not available (e. g. no rights to read)')
+		
+		def testJournalFilesArg(self):
+			# retrieve current system journal path
+			jrnlfile = self._getRuntimeJournal()
+			self._initFilter(journalfiles=jrnlfile)
 
-		def isEmpty(self, delay=_maxWaitTime(5)):
-			# shorter wait time for not modified status
-			return Utils.wait_for(self.jail.isEmpty, _maxWaitTime(delay))
+		def testJournalPathArg(self):
+			# retrieve current system journal path
+			jrnlpath = self._getRuntimeJournal()
+			jrnlpath = os.path.dirname(jrnlpath)
+			self._initFilter(journalpath=jrnlpath)
+			self.filter.seekToTime(
+				datetime.datetime.now() - datetime.timedelta(days=1)
+			)
+			self.filter.start()
+			self.waitForTicks(2)
+			self.assertTrue(self.isEmpty(1))
+			self.assertEqual(len(self.jail), 0)
+			self.assertRaises(FailManagerEmpty, self.filter.failManager.toBan)
+
+		def testJournalFlagsArg(self):
+			self._initFilter(journalflags=0) # e. g. 2 - journal.RUNTIME_ONLY
 
 		def assert_correct_ban(self, test_ip, test_attempts):
-			self.assertTrue(self.isFilled(_maxWaitTime(10))) # give Filter a chance to react
+			self.assertTrue(self.waitFailTotal(test_attempts, 10)) # give Filter a chance to react
 			ticket = self.jail.getFailTicket()
+			self.assertTrue(ticket)
 
 			attempts = ticket.getAttempt()
 			ip = ticket.getIP()
@@ -960,6 +1308,18 @@ def get_monitor_failures_journal_testcase(Filter_): # pragma: systemd no cover
 			self.assertEqual(attempts, test_attempts)
 
 		def test_grow_file(self):
+			self._test_grow_file()
+
+		def test_grow_file_in_idle(self):
+			self._test_grow_file(True)
+
+		def _test_grow_file(self, idle=False):
+			self._initFilter()
+			self.filter.start()
+			if idle:
+				self.filter.sleeptime /= 100.0
+				self.filter.idle = True
+				self.waitForTicks(1)
 			self.assertRaises(FailManagerEmpty, self.filter.failManager.toBan)
 
 			# Now let's feed it with entries from the file
@@ -972,6 +1332,10 @@ def get_monitor_failures_journal_testcase(Filter_): # pragma: systemd no cover
 
 			_copy_lines_to_journal(
 				self.test_file, self.journal_fields, skip=2, n=3)
+			if idle:
+				self.waitForTicks(1)
+				self.assertTrue(self.isEmpty(1))
+				return
 			self.assertTrue(self.isFilled(10))
 			# so we sleep for up to 6 sec for it not to become empty,
 			# and meanwhile pass to other thread(s) and filter should
@@ -989,6 +1353,8 @@ def get_monitor_failures_journal_testcase(Filter_): # pragma: systemd no cover
 			self.assert_correct_ban("193.168.0.128", 3)
 
 		def test_delJournalMatch(self):
+			self._initFilter()
+			self.filter.start()
 			# Smoke test for removing of match
 
 			# basic full test
@@ -1005,7 +1371,7 @@ def get_monitor_failures_journal_testcase(Filter_): # pragma: systemd no cover
 			_copy_lines_to_journal(
 				self.test_file, self.journal_fields, n=5, skip=5)
 			# so we should get no more failures detected
-			self.assertTrue(self.isEmpty(_maxWaitTime(10)))
+			self.assertTrue(self.isEmpty(10))
 
 			# but then if we add it back again
 			self.filter.addJournalMatch([
@@ -1018,7 +1384,37 @@ def get_monitor_failures_journal_testcase(Filter_): # pragma: systemd no cover
 			# we should detect the failures
 			self.assertTrue(self.isFilled(10))
 
-	return MonitorJournalFailures
+		def test_WrongChar(self):
+			self._initFilter()
+			self.filter.start()
+			# Now let's feed it with entries from the file
+			_copy_lines_to_journal(
+				self.test_file, self.journal_fields, skip=15, n=4)
+			self.waitForTicks(1)
+			self.assertTrue(self.isFilled(10))
+			self.assert_correct_ban("87.142.124.10", 4)
+			# Add direct utf, unicode, blob:
+			for l in (
+		    "error: PAM: Authentication failure for \xe4\xf6\xfc\xdf from 192.0.2.1",
+		   u"error: PAM: Authentication failure for \xe4\xf6\xfc\xdf from 192.0.2.1",
+		   b"error: PAM: Authentication failure for \xe4\xf6\xfc\xdf from 192.0.2.1".decode('utf-8', 'replace'),
+		    "error: PAM: Authentication failure for \xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f from 192.0.2.2",
+		   u"error: PAM: Authentication failure for \xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f from 192.0.2.2",
+		   b"error: PAM: Authentication failure for \xc3\xa4\xc3\xb6\xc3\xbc\xc3\x9f from 192.0.2.2".decode('utf-8', 'replace')
+			):
+				fields = self.journal_fields
+				fields.update(TEST_JOURNAL_FIELDS)
+				journal.send(MESSAGE=l, **fields)
+			self.waitForTicks(1)
+			self.waitFailTotal(6, 10)
+			self.assertTrue(Utils.wait_for(lambda: len(self.jail) == 2, 10))
+			self.assertSortedEqual([self.jail.getFailTicket().getIP(), self.jail.getFailTicket().getIP()], 
+				["192.0.2.1", "192.0.2.2"])
+
+	cls = MonitorJournalFailures
+	cls.__qualname__ = cls.__name__ = "MonitorJournalFailures<%s>(%s)" \
+			  % (Filter_.__name__, testclass_name)
+	return cls
 
 
 class GetFailures(LogCaptureTestCase):
@@ -1041,6 +1437,8 @@ class GetFailures(LogCaptureTestCase):
 		self.jail = DummyJail()
 		self.filter = FileFilter(self.jail)
 		self.filter.active = True
+		# speedup search using exact date pattern:
+		self.filter.setDatePattern('^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?')
 		# TODO Test this
 		#self.filter.setTimeRegex("\S{3}\s{1,2}\d{1,2} \d{2}:\d{2}:\d{2}")
 		#self.filter.setTimePattern("%b %d %H:%M:%S")
@@ -1058,7 +1456,7 @@ class GetFailures(LogCaptureTestCase):
 		self.assertEqual(self.filter.getLogPaths(), [GetFailures.FILENAME_01])
 		self.filter.addLogPath(GetFailures.FILENAME_02, tail=True)
 		self.assertEqual(self.filter.getLogCount(), 2)
-		self.assertEqual(sorted(self.filter.getLogPaths()), sorted([GetFailures.FILENAME_01, GetFailures.FILENAME_02]))
+		self.assertSortedEqual(self.filter.getLogPaths(), [GetFailures.FILENAME_01, GetFailures.FILENAME_02])
 
 	def testTail(self):
 		# There must be no containters registered, otherwise [-1] indexing would be wrong
@@ -1147,6 +1545,11 @@ class GetFailures(LogCaptureTestCase):
 		output = (('212.41.96.186', 4, 1124013600.0),
 				  ('212.41.96.185', 2, 1124013598.0))
 
+		# speedup search using exact date pattern:
+		self.filter.setDatePattern(('^%ExY(?P<_sep>[-/.])%m(?P=_sep)%d[T ]%H:%M:%S(?:[.,]%f)?(?:\s*%z)?',
+			'^(?:%a )?%b %d %H:%M:%S(?:\.%f)?(?: %ExY)?',
+			'^EPOCH'
+		))
 		self.filter.setMaxRetry(2)
 		self.filter.addLogPath(GetFailures.FILENAME_04, autoSeek=0)
 		self.filter.addFailRegex("Invalid user .* <HOST>")
@@ -1176,6 +1579,8 @@ class GetFailures(LogCaptureTestCase):
 				if enc is not None:
 					self.tearDown();self.setUp();
 					self.filter.setLogEncoding(enc);
+				# speedup search using exact date pattern:
+				self.filter.setDatePattern('^%ExY-%Exm-%Exd %ExH:%ExM:%ExS')
 				self.assertNotLogged('Error decoding line');
 				self.filter.addLogPath(fname)
 				self.filter.addFailRegex(failregex)
@@ -1217,6 +1622,7 @@ class GetFailures(LogCaptureTestCase):
 			('no',   output_no),
 			('warn', output_yes)
 		):
+			self.pruneLog("[test-phase useDns=%s]" % useDns)
 			jail = DummyJail()
 			filter_ = FileFilter(jail, useDns=useDns)
 			filter_.active = True
@@ -1250,8 +1656,8 @@ class GetFailures(LogCaptureTestCase):
 		output = [("192.0.43.10", 2, 1124013599.0),
 			("192.0.43.11", 1, 1124013598.0)]
 		self.filter.addLogPath(GetFailures.FILENAME_MULTILINE, autoSeek=False)
-		self.filter.addFailRegex("^.*rsyncd\[(?P<pid>\d+)\]: connect from .+ \(<HOST>\)$<SKIPLINES>^.+ rsyncd\[(?P=pid)\]: rsync error: .*$")
 		self.filter.setMaxLines(100)
+		self.filter.addFailRegex("^.*rsyncd\[(?P<pid>\d+)\]: connect from .+ \(<HOST>\)$<SKIPLINES>^.+ rsyncd\[(?P=pid)\]: rsync error: .*$")
 		self.filter.setMaxRetry(1)
 
 		self.filter.getFailures(GetFailures.FILENAME_MULTILINE)
@@ -1263,14 +1669,14 @@ class GetFailures(LogCaptureTestCase):
 					_ticket_tuple(self.filter.failManager.toBan())[0:3])
 			except FailManagerEmpty:
 				break
-		self.assertEqual(sorted(foundList), sorted(output))
+		self.assertSortedEqual(foundList, output)
 
 	def testGetFailuresMultiLineIgnoreRegex(self):
 		output = [("192.0.43.10", 2, 1124013599.0)]
 		self.filter.addLogPath(GetFailures.FILENAME_MULTILINE, autoSeek=False)
+		self.filter.setMaxLines(100)
 		self.filter.addFailRegex("^.*rsyncd\[(?P<pid>\d+)\]: connect from .+ \(<HOST>\)$<SKIPLINES>^.+ rsyncd\[(?P=pid)\]: rsync error: .*$")
 		self.filter.addIgnoreRegex("rsync error: Received SIGINT")
-		self.filter.setMaxLines(100)
 		self.filter.setMaxRetry(1)
 
 		self.filter.getFailures(GetFailures.FILENAME_MULTILINE)
@@ -1284,9 +1690,9 @@ class GetFailures(LogCaptureTestCase):
 			("192.0.43.11", 1, 1124013598.0),
 			("192.0.43.15", 1, 1124013598.0)]
 		self.filter.addLogPath(GetFailures.FILENAME_MULTILINE, autoSeek=False)
+		self.filter.setMaxLines(100)
 		self.filter.addFailRegex("^.*rsyncd\[(?P<pid>\d+)\]: connect from .+ \(<HOST>\)$<SKIPLINES>^.+ rsyncd\[(?P=pid)\]: rsync error: .*$")
 		self.filter.addFailRegex("^.* sendmail\[.*, msgid=<(?P<msgid>[^>]+).*relay=\[<HOST>\].*$<SKIPLINES>^.+ spamd: result: Y \d+ .*,mid=<(?P=msgid)>(,bayes=[.\d]+)?(,autolearn=\S+)?\s*$")
-		self.filter.setMaxLines(100)
 		self.filter.setMaxRetry(1)
 
 		self.filter.getFailures(GetFailures.FILENAME_MULTILINE)
@@ -1298,7 +1704,7 @@ class GetFailures(LogCaptureTestCase):
 					_ticket_tuple(self.filter.failManager.toBan())[0:3])
 			except FailManagerEmpty:
 				break
-		self.assertEqual(sorted(foundList), sorted(output))
+		self.assertSortedEqual(foundList, output)
 
 
 class DNSUtilsTests(unittest.TestCase):
@@ -1313,6 +1719,8 @@ class DNSUtilsTests(unittest.TestCase):
 			c.set(i, i)
 		for i in xrange(5):
 			self.assertEqual(c.get(i), i)
+		# remove unavailable key:
+		c.unset('a'); c.unset('a')
 
 	def testCacheMaxSize(self):
 		c = Utils.Cache(maxCount=5, maxTime=60)
@@ -1320,11 +1728,11 @@ class DNSUtilsTests(unittest.TestCase):
 		for i in xrange(5):
 			c.set(i, i)
 		self.assertEqual([c.get(i) for i in xrange(5)], [i for i in xrange(5)])
-		self.assertFalse(-1 in [c.get(i, -1) for i in xrange(5)])
+		self.assertNotIn(-1, (c.get(i, -1) for i in xrange(5)))
 		# add one - too many:
 		c.set(10, i)
 		# one element should be removed :
-		self.assertTrue(-1 in [c.get(i, -1) for i in xrange(5)])
+		self.assertIn(-1, (c.get(i, -1) for i in xrange(5)))
 		# test max size (not expired):
 		for i in xrange(10):
 			c.set(i, 1)
@@ -1351,6 +1759,7 @@ class DNSUtilsNetworkTests(unittest.TestCase):
 
 	def setUp(self):
 		"""Call before every test case."""
+		super(DNSUtilsNetworkTests, self).setUp()
 		unittest.F2B.SkipIfNoNetwork()
 
 	def test_IPAddr(self):
@@ -1394,10 +1803,10 @@ class DNSUtilsNetworkTests(unittest.TestCase):
 		self.assertEqual(res, [])
 		res = DNSUtils.textToIp('www.example.com', 'warn')
 		# sort ipaddr, IPv4 is always smaller as IPv6
-		self.assertEqual(sorted(res), ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'])
+		self.assertSortedEqual(res, ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'])
 		res = DNSUtils.textToIp('www.example.com', 'yes')
 		# sort ipaddr, IPv4 is always smaller as IPv6
-		self.assertEqual(sorted(res), ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'])
+		self.assertSortedEqual(res, ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'])
 
 	def testTextToIp(self):
 		# Test hostnames
@@ -1410,7 +1819,7 @@ class DNSUtilsNetworkTests(unittest.TestCase):
 			res = DNSUtils.textToIp(s, 'yes')
 			if s == 'www.example.com':
 				# sort ipaddr, IPv4 is always smaller as IPv6
-				self.assertEqual(sorted(res), ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'])
+				self.assertSortedEqual(res, ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'])
 			else:
 				self.assertEqual(res, [])
 		# pure ips:
@@ -1566,6 +1975,10 @@ class DNSUtilsNetworkTests(unittest.TestCase):
 		ips = IPAddr('example.com')
 		self.assertTrue(IPAddr("93.184.216.34").isInNet(ips))
 		self.assertTrue(IPAddr("2606:2800:220:1:248:1893:25c8:1946").isInNet(ips))
+
+	def testIPAddr_wrongDNS_IP(self):
+		DNSUtils.dnsToIp('`this`.dns-is-wrong.`wrong-nic`-dummy')
+		DNSUtils.ipToName('*')
 
 	def testIPAddr_Cached(self):
 		ips = [DNSUtils.dnsToIp('example.com'), DNSUtils.dnsToIp('example.com')]

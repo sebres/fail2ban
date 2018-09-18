@@ -31,9 +31,10 @@ if LooseVersion(getattr(journal, '__version__', "0")) < '204':
 	raise ImportError("Fail2Ban requires systemd >= 204")
 
 from .failmanager import FailManagerEmpty
-from .filter import JournalFilter
+from .filter import JournalFilter, Filter
 from .mytime import MyTime
-from ..helpers import getLogger
+from .utils import Utils
+from ..helpers import getLogger, logging, splitwords, uni_decode
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
@@ -54,13 +55,43 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 	# @param jail the jail object
 
 	def __init__(self, jail, **kwargs):
+		jrnlargs = FilterSystemd._getJournalArgs(kwargs)
 		JournalFilter.__init__(self, jail, **kwargs)
-		self.__modified = False
+		self.__modified = 0
 		# Initialise systemd-journal connection
-		self.__journal = journal.Reader(converters={'__CURSOR': lambda x: x})
+		self.__journal = journal.Reader(**jrnlargs)
 		self.__matches = []
 		self.setDatePattern(None)
 		logSys.debug("Created FilterSystemd")
+
+	@staticmethod
+	def _getJournalArgs(kwargs):
+		args = {'converters':{'__CURSOR': lambda x: x}}
+		try:
+			args['path'] = kwargs.pop('journalpath')
+		except KeyError:
+			pass
+
+		try:
+			args['files'] = kwargs.pop('journalfiles')
+		except KeyError:
+			pass
+		else:
+			import glob
+			p = args['files']
+			if not isinstance(p, (list, set, tuple)):
+				p = splitwords(p)
+			files = []
+			for p in p:
+				files.extend(glob.glob(p))
+			args['files'] = list(set(files))
+
+		try:
+			args['flags'] = int(kwargs.pop('journalflags'))
+		except KeyError:
+			pass
+
+		return args
 
 	##
 	# Add a journal match filters from list structure
@@ -99,7 +130,8 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 			self.resetJournalMatches()
 			raise
 		else:
-			logSys.info("Added journal match for: %r", " ".join(match))
+			logSys.info("[%s] Added journal match for: %r", self.jailName, 
+				" ".join(match))
 	##
 	# Reset a journal match filter called on removal or failure
 	#
@@ -107,7 +139,7 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 
 	def resetJournalMatches(self):
 		self.__journal.flush_matches()
-		logSys.debug("Flushed all journal matches")
+		logSys.debug("[%s] Flushed all journal matches", self.jailName)
 		match_copy = self.__matches[:]
 		self.__matches = []
 		try:
@@ -123,13 +155,20 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 	#
 	# @param match journalctl syntax matches
 
-	def delJournalMatch(self, match):
-		if match in self.__matches:
+	def delJournalMatch(self, match=None):
+		# clear all:
+		if match is None:
+			if not self.__matches:
+				return
+			del self.__matches[:]
+		# delete by index:
+		elif match in self.__matches:
 			del self.__matches[self.__matches.index(match)]
-			self.resetJournalMatches()
 		else:
-			raise ValueError("Match not found")
-		logSys.info("Removed journal match for: %r" % " ".join(match))
+			raise ValueError("Match %r not found" % match)
+		self.resetJournalMatches()
+		logSys.info("[%s] Removed journal match for: %r", self.jailName, 
+			match if match else '*')
 
 	##
 	# Get current journal match filter
@@ -139,21 +178,13 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 	def getJournalMatch(self):
 		return self.__matches
 
-    ##
-    # Join group of log elements which may be a mix of bytes and strings
-    #
-    # @param elements list of strings and bytes
-    # @return elements joined as string
+	##
+	# Get journal reader
+	#
+	# @return journal reader
 
-	@staticmethod
-	def _joinStrAndBytes(elements):
-		strElements = []
-		for element in elements:
-			if isinstance(element, str):
-				strElements.append(element)
-			else:
-				strElements.append(str(element, errors='ignore'))
-		return " ".join(strElements)
+	def getJournalReader(self):
+		return self.__journal
 
 	##
 	# Format journal log entry into syslog style
@@ -161,51 +192,50 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 	# @param entry systemd journal entry dict
 	# @return format log line
 
-	@classmethod
-	def formatJournalEntry(cls, logentry):
-		logelements = [""]
-		if logentry.get('_HOSTNAME'):
-			logelements.append(logentry['_HOSTNAME'])
-		if logentry.get('SYSLOG_IDENTIFIER'):
-			logelements.append(logentry['SYSLOG_IDENTIFIER'])
-			if logentry.get('SYSLOG_PID'):
-				logelements[-1] += ("[%i]" % logentry['SYSLOG_PID'])
-			elif logentry.get('_PID'):
-				logelements[-1] += ("[%i]" % logentry['_PID'])
+	def formatJournalEntry(self, logentry):
+		# Be sure, all argument of line tuple should have the same type:
+		enc = self.getLogEncoding()
+		logelements = []
+		v = logentry.get('_HOSTNAME')
+		if v:
+			logelements.append(uni_decode(v, enc))
+		v = logentry.get('SYSLOG_IDENTIFIER')
+		if not v:
+			v = logentry.get('_COMM')
+		if v:
+			logelements.append(uni_decode(v, enc))
+			v = logentry.get('SYSLOG_PID')
+			if not v:
+				v = logentry.get('_PID')
+			if v:
+				logelements[-1] += ("[%i]" % v)
 			logelements[-1] += ":"
-		elif logentry.get('_COMM'):
-			logelements.append(logentry['_COMM'])
-			if logentry.get('_PID'):
-				logelements[-1] += ("[%i]" % logentry['_PID'])
-			logelements[-1] += ":"
-		if logelements[-1] == "kernel:":
-			if '_SOURCE_MONOTONIC_TIMESTAMP' in logentry:
-				monotonic = logentry.get('_SOURCE_MONOTONIC_TIMESTAMP')
-			else:
-				monotonic = logentry.get('__MONOTONIC_TIMESTAMP')[0]
-			logelements.append("[%12.6f]" % monotonic.total_seconds())
-		if isinstance(logentry.get('MESSAGE',''), list):
-			logelements.append(" ".join(logentry['MESSAGE']))
+			if logelements[-1] == "kernel:":
+				if '_SOURCE_MONOTONIC_TIMESTAMP' in logentry:
+					monotonic = logentry.get('_SOURCE_MONOTONIC_TIMESTAMP')
+				else:
+					monotonic = logentry.get('__MONOTONIC_TIMESTAMP')[0]
+				logelements.append("[%12.6f]" % monotonic.total_seconds())
+		msg = logentry.get('MESSAGE','')
+		if isinstance(msg, list):
+			logelements.append(" ".join(uni_decode(v, enc) for v in msg))
 		else:
-			logelements.append(logentry.get('MESSAGE', ''))
+			logelements.append(uni_decode(msg, enc))
 
-		try:
-			logline = u" ".join(logelements)
-		except UnicodeDecodeError:
-			# Python 2, so treat as string
-			logline = " ".join([str(logline) for logline in logelements])
-		except TypeError:
-			# Python 3, one or more elements bytes
-			logSys.warning("Error decoding log elements from journal: %s" %
-				repr(logelements))
-			logline =  cls._joinStrAndBytes(logelements)
+		logline = " ".join(logelements)
 
 		date = logentry.get('_SOURCE_REALTIME_TIMESTAMP',
 				logentry.get('__REALTIME_TIMESTAMP'))
-		logSys.debug("Read systemd journal entry: %r" %
-			"".join([date.isoformat(), logline]))
-		return (('', date.isoformat(), logline),
+		logSys.log(5, "[%s] Read systemd journal entry: %s %s", self.jailName,
+			date.isoformat(), logline)
+		## use the same type for 1st argument:
+		return ((logline[:0], date.isoformat(), logline),
 			time.mktime(date.timetuple()) + date.microsecond/1.0E6)
+
+	def seekToTime(self, date):
+		if not isinstance(date, datetime.datetime):
+			date = datetime.datetime.fromtimestamp(date)
+		self.__journal.seek_realtime(date)
 
 	##
 	# Main loop.
@@ -224,7 +254,7 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 		# Seek to now - findtime in journal
 		start_time = datetime.datetime.now() - \
 				datetime.timedelta(seconds=int(self.getFindTime()))
-		self.__journal.seek_realtime(start_time)
+		self.seekToTime(start_time)
 		# Move back one entry to ensure do not end up in dead space
 		# if start time beyond end of journal
 		try:
@@ -233,18 +263,40 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 			pass # Reading failure, so safe to ignore
 
 		while self.active:
-			if not self.idle:
+			# wait for records (or for timeout in sleeptime seconds):
+			try:
+				## todo: find better method as wait_for to break (e.g. notify) journal.wait(self.sleeptime),
+				## don't use `journal.close()` for it, because in some python/systemd implementation it may 
+				## cause abnormal program termination
+				#self.__journal.wait(self.sleeptime) != journal.NOP
+				## 
+				## wait for entries without sleep in intervals, because "sleeping" in journal.wait:
+				Utils.wait_for(lambda: not self.active or \
+					self.__journal.wait(Utils.DEFAULT_SLEEP_INTERVAL) != journal.NOP,
+					self.sleeptime, 0.00001)
+				if self.idle:
+					# because journal.wait will returns immediatelly if we have records in journal,
+					# just wait a little bit here for not idle, to prevent hi-load:
+					if not Utils.wait_for(lambda: not self.active or not self.idle, 
+						self.sleeptime * 10, self.sleeptime
+					):
+						self.ticks += 1
+						continue
+				self.__modified = 0
 				while self.active:
+					logentry = None
 					try:
 						logentry = self.__journal.get_next()
-					except OSError:
-						logSys.warning(
-							"Error reading line from systemd journal")
-						continue
+					except OSError as e:
+						logSys.error("Error reading line from systemd journal: %s",
+							e, exc_info=logSys.getEffectiveLevel() <= logging.DEBUG)
+					self.ticks += 1
 					if logentry:
 						self.processLineAndAdd(
 							*self.formatJournalEntry(logentry))
-						self.__modified = True
+						self.__modified += 1
+						if self.__modified >= 100: # todo: should be configurable
+							break
 					else:
 						break
 				if self.__modified:
@@ -254,10 +306,25 @@ class FilterSystemd(JournalFilter): # pragma: systemd no cover
 							self.jail.putFailTicket(ticket)
 					except FailManagerEmpty:
 						self.failManager.cleanup(MyTime.time())
-					self.__modified = False
-			self.__journal.wait(self.sleeptime)
-		logSys.debug((self.jail is not None and self.jail.name
-                      or "jailless") +" filter terminated")
+			except Exception as e: # pragma: no cover
+				if not self.active: # if not active - error by stop...
+					break
+				logSys.error("Caught unhandled exception in main cycle: %r", e,
+					exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+				# incr common error counter:
+				self.commonError()
+
+		logSys.debug("[%s] filter terminated", self.jailName)
+
+		# close journal:
+		try:
+			if self.__journal:
+				self.__journal.close()
+		except Exception as e: # pragma: no cover
+			logSys.error("Close journal failed: %r", e,
+				exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+
+		logSys.debug("[%s] filter exited (systemd)", self.jailName)
 		return True
 
 	def status(self, flavor="basic"):

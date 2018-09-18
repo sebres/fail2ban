@@ -1,4 +1,3 @@
-#!/usr/bin/python
 # emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: t -*-
 # vi: set ft=python sts=4 ts=4 sw=4 noet :
 #
@@ -37,6 +36,8 @@ from .beautifier import Beautifier
 from .fail2bancmdline import Fail2banCmdLine, ServerExecutionException, ExitException, \
 	logSys, exit, output
 
+from ..server.utils import Utils
+
 PROMPT = "fail2ban> "
 
 
@@ -68,10 +69,11 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 		# Print a new line because we probably come from wait
 		output("")
 		logSys.warning("Caught signal %d. Exiting" % signum)
-		exit(-1)
+		exit(255)
 
-	def __ping(self):
-		return self.__processCmd([["ping"]], False)
+	def __ping(self, timeout=0.1):
+		return self.__processCmd([["ping"] + ([timeout] if timeout != -1 else [])],
+			False, timeout=timeout)
 
 	@property
 	def beautifier(self):
@@ -80,7 +82,7 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 		self._beautifier = Beautifier()
 		return self._beautifier
 
-	def __processCmd(self, cmd, showRet=True):
+	def __processCmd(self, cmd, showRet=True, timeout=-1):
 		client = None
 		try:
 			beautifier = self.beautifier
@@ -89,11 +91,15 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 				beautifier.setInputCmd(c)
 				try:
 					if not client:
-						client = CSocket(self._conf["socket"])
+						client = CSocket(self._conf["socket"], timeout=timeout)
+					elif timeout != -1:
+						client.settimeout(timeout)
+					if self._conf["verbose"] > 2:
+						logSys.log(5, "CMD: %r", c)
 					ret = client.send(c)
 					if ret[0] == 0:
-						logSys.debug("OK : %r", ret[1])
-						if showRet or c[0] == 'echo':
+						logSys.log(5, "OK : %r", ret[1])
+						if showRet or c[0] in ('echo', 'server-status'):
 							output(beautifier.beautify(ret[1]))
 					else:
 						logSys.error("NOK: %r", ret[1].args)
@@ -102,10 +108,10 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 						streamRet = False
 				except socket.error as e:
 					if showRet or self._conf["verbose"] > 1:
-						if showRet or c != ["ping"]:
-							self.__logSocketError()
+						if showRet or c[0] != "ping":
+							self.__logSocketError(e, c[0] == "ping")
 						else:
-							logSys.debug(" -- ping failed -- %r", e)
+							logSys.log(5, " -- %s failed -- %r", c, e)
 					return False
 				except Exception as e: # pragma: no cover
 					if showRet or self._conf["verbose"] > 1:
@@ -119,21 +125,25 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 			if client:
 				try :
 					client.close()
-				except Exception as e:
+				except Exception as e: # pragma: no cover
 					if showRet or self._conf["verbose"] > 1:
 						logSys.debug(e)
-			if showRet or c[0] == 'echo':
+			if showRet or c[0] in ('echo', 'server-status'):
 				sys.stdout.flush()
 		return streamRet
 
-	def __logSocketError(self):
+	def __logSocketError(self, prevError="", errorOnly=False):
 		try:
 			if os.access(self._conf["socket"], os.F_OK): # pragma: no cover
 				# This doesn't check if path is a socket,
 				#  but socket.error should be raised
 				if os.access(self._conf["socket"], os.W_OK):
 					# Permissions look good, but socket.error was raised
-					logSys.error("Unable to contact server. Is it running?")
+					if errorOnly:
+						logSys.error(prevError)
+					else:
+						logSys.error("%sUnable to contact server. Is it running?", 
+							("[%s] " % prevError) if prevError else '')
 				else:
 					logSys.error("Permission denied to socket: %s,"
 								 " (you must be root)", self._conf["socket"])
@@ -176,7 +186,7 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 			logSys.error("Fail2ban seems to be in unexpected state (not running but the socket exists)")
 			return None
 
-		stream.append(['echo', 'Server ready'])
+		stream.append(['server-status'])
 		return stream
 
 	##
@@ -189,7 +199,7 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 		# Start the server or just initialize started one:
 		try:
 			if background:
-				# Start server daemon as fork of client process:
+				# Start server daemon as fork of client process (or new process):
 				Fail2banServer.startServerAsync(self._conf)
 				# Send config stream to server:
 				if not self.__processStartStreamAfterWait(stream, False):
@@ -218,22 +228,27 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 		return True
 
 	##
-	def configureServer(self, async=True, phase=None):
-		# if asynchron start this operation in the new thread:
-		if async:
+	def configureServer(self, nonsync=True, phase=None):
+		# if asynchronous start this operation in the new thread:
+		if nonsync:
 			th = Thread(target=Fail2banClient.configureServer, args=(self, False, phase))
 			th.daemon = True
 			return th.start()
 		# prepare: read config, check configuration is valid, etc.:
 		if phase is not None:
 			phase['start'] = True
-			logSys.debug('  client phase %s', phase)
+			logSys.log(5, '  client phase %s', phase)
 		stream = self.__prepareStartServer()
 		if phase is not None:
 			phase['ready'] = phase['start'] = (True if stream else False)
-			logSys.debug('  client phase %s', phase)
+			logSys.log(5, '  client phase %s', phase)
 		if not stream:
 			return False
+		# wait a litle bit for phase "start-ready" before enter active waiting:
+		if phase is not None:
+			Utils.wait_for(lambda: phase.get('start-ready', None) is not None, 0.5, 0.001)
+			phase['configure'] = (True if stream else False)
+			logSys.log(5, '  client phase %s', phase)
 		# configure server with config stream:
 		ret = self.__processStartStreamAfterWait(stream, False)
 		if phase is not None:
@@ -247,6 +262,10 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 	# @param cmd the command line
 
 	def __processCommand(self, cmd):
+		# wrap tuple to list (because could be modified here):
+		if not isinstance(cmd, list):
+			cmd = list(cmd)
+		# process:
 		if len(cmd) == 1 and cmd[0] == "start":
 
 			ret = self.__startServer(self._conf["background"])
@@ -254,8 +273,12 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 				return False
 			return ret
 
-		elif len(cmd) == 1 and cmd[0] == "restart":
-
+		elif len(cmd) >= 1 and cmd[0] == "restart":
+			# if restart jail - re-operate via "reload --restart ...":
+			if len(cmd) > 1:
+				cmd[0:1] = ["reload", "--restart"]
+				return self.__processCommand(cmd)
+			# restart server:
 			if self._conf.get("interactive", False):
 				output('  ## stop ... ')
 			self.__processCommand(['stop'])
@@ -274,9 +297,21 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 			return self.__processCommand(['start'])
 
 		elif len(cmd) >= 1 and cmd[0] == "reload":
-			if self.__ping():
-				if len(cmd) == 1:
-					jail = 'all'
+			# reload options:
+			opts = []
+			while len(cmd) >= 2:
+				if cmd[1] in ('--restart', "--unban", "--if-exists"):
+					opts.append(cmd[1])
+					del cmd[1]
+				else:
+					if len(cmd) > 2:
+						logSys.error("Unexpected argument(s) for reload: %r", cmd[1:])
+						return False
+					# stop options - jail name or --all
+					break
+			if self.__ping(timeout=-1):
+				if len(cmd) == 1 or cmd[1] == '--all':
+					jail = '--all'
 					ret, stream = self.readConfig()
 				else:
 					jail = cmd[1]
@@ -284,12 +319,16 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 				# Do not continue if configuration is not 100% valid
 				if not ret:
 					return False
-				self.__processCmd([['stop', jail]], False)
-				# Configure the server
-				return self.__processCmd(stream, True)
+				if self._conf.get("interactive", False):
+					output('  ## reload ... ')
+				# Reconfigure the server
+				return self.__processCmd([['reload', jail, opts, stream]], True)
 			else:
 				logSys.error("Could not find server")
 				return False
+
+		elif len(cmd) > 1 and cmd[0] == "ping":
+			return self.__processCmd([cmd], timeout=float(cmd[1]))
 
 		else:
 			return self.__processCmd([cmd])
@@ -321,22 +360,24 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 			maxtime = self._conf["timeout"]
 		# Wait for the server to start (the server has 30 seconds to answer ping)
 		starttime = time.time()
-		logSys.debug("__waitOnServer: %r", (alive, maxtime))
-		test = lambda: os.path.exists(self._conf["socket"]) and self.__ping()
+		logSys.log(5, "__waitOnServer: %r", (alive, maxtime))
+		sltime = 0.0125 / 2
+		test = lambda: os.path.exists(self._conf["socket"]) and self.__ping(timeout=sltime)
 		with VisualWait(self._conf["verbose"]) as vis:
-			sltime = 0.0125 / 2
 			while self._alive:
 				runf = test()
 				if runf == alive:
 					return True
-				now = time.time()
+				waittime = time.time() - starttime
+				logSys.log(5, "  wait-time: %s", waittime)
 				# Wonderful visual :)
-				if now > starttime + 1:
+				if waittime > 1:
 					vis.heartbeat()
 				# f end time reached:
-				if now - starttime >= maxtime:
+				if waittime >= maxtime:
 					raise ServerExecutionException("Failed to start server")
-				sltime = min(sltime * 2, 0.5)
+				# first 200ms faster:
+				sltime = min(sltime * 2, 0.5 if waittime > 0.2 else 0.1)
 				time.sleep(sltime)
 		return False
 
@@ -382,7 +423,7 @@ class Fail2banClient(Fail2banCmdLine, Thread):
 							elif not cmd == "":
 								try:
 									self.__processCommand(shlex.split(cmd))
-								except Exception, e: # pragma: no cover
+								except Exception as e: # pragma: no cover
 									if self._conf["verbose"] > 1:
 										logSys.exception(e)
 									else:
@@ -459,5 +500,5 @@ def exec_command_line(argv):
 	if client.start(argv):
 		exit(0)
 	else:
-		exit(-1)
+		exit(255)
 
