@@ -104,6 +104,7 @@ class Fail2banCmdLine():
 		output("    --syslogsocket auto|<FILE>")
 		output("    -d                      dump configuration. For debugging")
 		output("    --dp, --dump-pretty     dump the configuration using more human readable representation")
+		output("    --dj, --dump-json       dump the configuration using JSON representation")
 		output("    -t, --test              test configuration (can be also specified with start parameters)")
 		output("    -i                      interactive mode")
 		output("    -v                      increase verbosity")
@@ -137,8 +138,12 @@ class Fail2banCmdLine():
 				self._conf["socket"] = opt[1]
 			elif o in ("-p", "--pidfile"):
 				self._conf["pidfile"] = opt[1]
-			elif o in ("-d", "--dp", "--dump-pretty"):
-				self._conf["dump"] = True if o == "-d" else 2
+			elif o in ("-d"):
+				self._conf["dump"] = True
+			elif o in ("--dp", "--dump-pretty"):
+				self._conf["dump"] = 'pretty'
+			elif o in ("--dj", "--dump-json"):
+				self._conf["dump"] = 'json'
 			elif o in ("-t", "--test"):
 				self.cleanConfOnly = True
 				self._conf["test"] = True
@@ -188,7 +193,7 @@ class Fail2banCmdLine():
 				cmdOpts = 'hc:s:p:xfbdtviqV'
 				cmdLongOpts = ['loglevel=', 'logtarget=', 'syslogsocket=', 'test', 'async',
 					'conf=', 'pidfile=', 'pname=', 'socket=',
-					'timeout=', 'str2sec=', 'help', 'version', 'dp', '--dump-pretty']
+					'timeout=', 'str2sec=', 'help', 'version', 'dp', 'dump-pretty', 'dj', 'dump-json']
 				optList, self._args = getopt.getopt(self._argv[1:], cmdOpts, cmdLongOpts)
 			except getopt.GetoptError:
 				self.dispUsage()
@@ -241,12 +246,12 @@ class Fail2banCmdLine():
 				self._conf["pidfile"], logging.getLevelName(llev), self._conf["logtarget"])
 
 			readcfg = True
-			if self._conf.get("dump", False):
+			if self._conf.get("dump", None):
 				if readcfg:
 					ret, stream = self.readConfig()
 					readcfg = False
 				if stream is not None:
-					self.dumpConfig(stream, self._conf["dump"] == 2)
+					self.dumpConfig(stream, self._conf["dump"])
 				else: # pragma: no cover
 					output("ERROR: The configuration stream failed because of the invalid syntax.")
 				if not self._conf.get("test", False):
@@ -292,11 +297,61 @@ class Fail2banCmdLine():
 		return ret, stream
 
 	@staticmethod
-	def dumpConfig(cmd, pretty=False):
-		if pretty:
-			from pprint import pformat
-			def _output(s):
-				output(pformat(s, width=1000, indent=2))
+	def dumpConfig(cmd, fmt=None):
+		if fmt:
+			if fmt == 'json':
+				import json
+				try:
+				 	from collections import OrderedDict
+				except ImportError: # pragma: 2.x no cover
+					OrderedDict = dict
+				d = {}
+				def _item(j, name):
+					i = j.get(name)
+					if not i: i = j[name] = OrderedDict()
+					return i
+				def _jail(name):
+					if not d.get('jail'): d['jail'] = OrderedDict()
+					j = d['jail'].get(name)
+					if not j: j = d['jail'][name] = OrderedDict()
+					return j
+				for c in cmd:
+					if len(c) == 3 and c[0] == 'set':
+						d[c[1]] = c[2]
+					elif len(c) == 3 and c[0] == 'add':
+						_jail(c[1])['backend'] = c[2]
+					elif len(c) > 3 and c[0] in ('set', 'multi-set'):
+						j = _jail(c[1])
+						v = c[3] if len(c) == 4 else c[3:]
+						k = c[2]
+						inst = list
+						if len(c) == 4 and k == 'addaction':
+							k = v; inst = OrderedDict; v = inst()
+							j = _item(j, 'action')
+						if k == 'action':
+							inst = OrderedDict
+							v = {v[0]: dict(v[1])}
+						if k in ("addfailregex", "addignoreregex", "addlogpath", "addjournalmatch"):
+							k = k[3:]
+						if k not in j:
+							j[k] = v
+						else:
+							if not isinstance(j[k], inst):
+								j[k] = inst(j[k])
+							if inst is list:
+								j[k] += v if isinstance(v, inst) else inst(v)
+							else:
+								j[k].update(inst(v))
+					elif len(c) == 2 and c[0] == 'start':
+						_jail(c[1])['enabled'] = True
+					# else:
+					# 	print('******', c)
+				output(json.dumps(d, indent=2))
+				return True
+			else: # pretty
+				from pprint import pformat
+				def _output(s):
+					output(pformat(s, width=1000, indent=2))
 		else:
 			_output = output
 		for c in cmd:
