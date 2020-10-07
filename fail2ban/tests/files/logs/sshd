@@ -328,6 +328,11 @@ Jun  6 04:17:04 host sshd[1189074]: Invalid user  from 192.0.2.68 port 34916
 # failJSON: { "time": "2005-06-06T04:17:09", "match": true , "host": "192.0.2.68", "dns": null, "user": "", "desc": "empty user, gh-2749" }
 Jun  6 04:17:09 host sshd[1189074]: Connection closed by invalid user  192.0.2.68 port 34916 [preauth]
 
+# failJSON: { "time": "2005-06-06T05:17:00", "match": false, "nofail": "Connection from", "desc": "new logging format with facility.priority, gh-2850" }
+Jun  6 05:17:00 auth.info host sshd[111499]: Connection from 192.0.2.70 port 58614 on 127.0.0.1 port 22 rdomain ""
+# failJSON: { "time": "2005-06-06T05:17:01", "match": true , "host": "192.0.2.70", "desc": "new logging format with facility.priority + other ddos vector, gh-2850" }
+Jun  6 05:17:01 auth.err host sshd[111499]: error: kex_exchange_identification: Connection closed by remote host
+
 # filterOptions: [{"mode": "extra"}, {"mode": "aggressive"}]
 
 # several other cases from gh-864:
