@@ -211,7 +211,7 @@ class Actions(JailThread, Mapping):
 	def getBanTime(self):
 		return self.banManager.getBanTime()
 
-	def getBanned(self, ids):
+	def getBanned(self, *ids):
 		lst = self.banManager.getBanList()
 		if not ids:
 			return lst
@@ -229,66 +229,61 @@ class Actions(JailThread, Mapping):
 		"""
 		return self.banManager.getBanList(ordered=True, withTime=withTime)
 
-	def addBannedIP(self, ip):
-		"""Ban an IP or list of IPs."""
-		unixTime = MyTime.time()
-
-		if isinstance(ip, list):
-			# Multiple IPs:
-			tickets = (BanTicket(ip, unixTime) for ip in ip)
-		else:
-			# Single IP:
-			tickets = (BanTicket(ip, unixTime),)
+	def addBanned(self, *tickets):
+		"""Ban tickets or IDs."""
+		if tickets and not isinstance(tickets[0], BanTicket):
+			unixTime = MyTime.time()
+			tickets = (BanTicket(ip, unixTime) for ip in tickets)
 
 		return self.__checkBan(tickets)
 
-	def removeMultiBannedIP(self, ips=None, db=True, ifexists=False):
-		"""Removes multiple banned IPs calling actions' unban method
+	def addBannedIP(self, ip):
+		"""Ban an IP or list of IPs.
+		Obsolete: superseded by addBanned."""
+		if isinstance(ip, list):
+			# Multiple IPs:
+			return addBanned(*ip)
+		else:
+			# Single IP:
+			return addBanned(ip)
 
-		Parameters
-		----------
-		ip : list, tuple or None
-			The IPs as list to unban or all IPs if None
+	def removeBanned(self, *ids, **kwargs):
+		"""Removes banned tickets calling actions' unban or flush method
 
-		Raises
-		------
-		ValueError
-			If at least one `ip` is not banned
-		"""
-		if ips is None:
-			return self.__flushBan(db)
-		missed = []
-		cnt = 0
-		for ip in ips:
-			try:
-				cnt += self.removeBannedIP(ip, db, ifexists)
-			except ValueError:
-				if not ifexists:
-					missed.append(ip)
-		if missed:
-			raise ValueError("not banned: %r" % missed)
-		return cnt
-
-	def removeBannedIP(self, ip=None, db=True, ifexists=False):
-		"""Removes banned IP calling actions' unban method
-
-		Remove a banned IP now, rather than waiting for it to expire,
+		Remove a banned IPs, rather than waiting for it to expire,
 		even if set to never expire.
 
 		Parameters
 		----------
-		ip : str, IPAddr, TUPLE_ID representation (tuple/list) or None
-			The ID to unban or all IPs if None
+		ids : list of str, IPAddr, TUPLE_ID representation (tuple).
+			The IDs to unban or all tickets if empty
 
 		Raises
 		------
 		ValueError
-			If `ip` is not banned
+			If `ids` is not banned
 		"""
+		db = kwargs.get('db', True)
+		ifexists = kwargs.get('ifexists', False)
 		# Unban all?
-		if ip is None:
-			return self.__flushBan(db)
+		if not ids:
+			return self.__flushBan(db=db)
+		# Multiple IPs:
+		if len(ids) > 1:
+			missed = []
+			cnt = 0
+			# unban every single IP (can be changed later if bulk-unban gets implemented):
+			for ip in ids:
+				try:
+					cnt += self.removeBanned(ip, db=db, ifexists=ifexists)
+				except ValueError:
+					if not ifexists:
+						missed.append(ip)
+			if missed:
+				raise ValueError("not banned: %r" % missed)
+			return cnt
 		# Single IP:
+		ip = ids[0]
 		# Always delete ip from database (also if currently not banned)
 		if db and self._jail.database is not None:
 			self._jail.database.delBan(self._jail, ip)
@@ -299,12 +294,12 @@ class Actions(JailThread, Mapping):
 			self.__unBan(ticket)
 		else:
 			# Multiple IPs by subnet or dns:
-			if not isinstance(ip, (IPAddr, tuple, list)):
+			if not isinstance(ip, IPAddr):
 				ipa = IPAddr(ip)
 				if not ipa.isSingle: # subnet (mask/cidr) or raw (may be dns/hostname):
 					ips = list(filter(ipa.contains, self.banManager.getBanList()))
 					if ips:
-						return self.removeMultiBannedIP(ips, db, ifexists)
+						return self.removeBanned(*ips, db=db, ifexists=ifexists)
 			# not found:
 			msg = "%s is not banned" % str(ip)
 			logSys.log(logging.MSG, msg)
@@ -313,6 +308,28 @@ class Actions(JailThread, Mapping):
 			raise ValueError(msg)
 		return 1
 
+	def removeBannedIP(self, ip=None, db=True, ifexists=False):
+		"""Removes banned IP calling actions' unban method.
+		Obsolete: superseded by removeBanned.
+
+		Remove a banned IP now, rather than waiting for it to expire,
+		even if set to never expire.
+
+		Parameters
+		----------
+		ip : list, str, IPAddr or None
+			The IP address (or multiple IPs as list) to unban or all IPs if None
+
+		Raises
+		------
+		ValueError
+			If `ip` is not banned
+		"""
+		# Unban all or multiple IPs?
+		if ip is None or isinstance(ip, (list, tuple)):
+			return self.removeBanned(*(ip if ip is not None else ()), db=db, ifexists=ifexists)
+		# Single IP:
+		return self.removeBanned(ip, db=db, ifexists=ifexists)
 
 	def stopActions(self, actions=None):
 		"""Stops the actions in reverse sequence (optionally filtered)

@@ -117,16 +117,15 @@ class Transmitter:
 			opts, value = getopt.getopt(command[1:], "", ["expr", "all"])
 			opts = dict(opts)
 			# if all ips:
-			if "--all" in opts:
-				return self.__server.setUnbanIP()
-			value = map(_parse_expr, value) if "--expr" in opts else value
-			return self.__server.setUnbanIP(None, value)
+			if "--expr" in opts: value = map(_parse_expr, value)
+			if "--all" in opts: value = ()
+			return self.__server.setUnbanIP(None, *value)
 		elif name == "banned":
 			# check IP is banned in all jails:
 			opts, value = getopt.getopt(command[1:], "", ["expr"])
 			opts = dict(opts)
-			value = map(_parse_expr, value) if "--expr" in opts else value
-			return self.__server.banned(None, value)
+			if "--expr" in opts: value = map(_parse_expr, value)
+			return self.__server.banned(None, *value)
 		elif name == "echo":
 			return command[1:]
 		elif name == "server-status":
@@ -367,7 +366,7 @@ class Transmitter:
 			opts, value = getopt.getopt(command[2:], "", ["expr"])
 			opts = dict(opts)
 			ip = _parse_expr(value[0]) if "--expr" in opts else value[0]
-			return self.__server.addAttemptIP(name, ip, value[1:])
+			return self.__server.addAttemptIP(name, ip, *value[1:])
 		elif command[1].startswith("bantime."):
 			value = command[2]
 			opt = command[1][len("bantime."):]
@@ -377,13 +376,14 @@ class Transmitter:
 		elif command[1] == "banip":
 			opts, value = getopt.getopt(command[2:], "", ["expr"])
 			opts = dict(opts)
-			value = map(_parse_expr, value) if "--expr" in opts else value
-			return self.__server.setBanIP(name,value)
+			if "--expr" in opts: value = map(_parse_expr, value)
+			return self.__server.setBanIP(name, *value)
 		elif command[1] == "unbanip":
-			opts, value = getopt.getopt(command[2:], "", ["expr", "report-absent"])
+			opts, value = getopt.getopt(command[2:], "", ["expr", "all", "report-absent"])
 			opts = dict(opts)
-			value = map(_parse_expr, value) if "--expr" in opts else value
-			return self.__server.setUnbanIP(name, value, ifexists=("--report-absent" not in opts))
+			if "--expr" in opts: value = map(_parse_expr, value)
+			if "--all" in opts: value = ()
+			return self.__server.setUnbanIP(name, *value, ifexists=("--report-absent" not in opts))
 		elif command[1] == "addaction":
 			args = [command[2]]
 			if len(command) > 3:
@@ -458,8 +458,8 @@ class Transmitter:
 			# check IP is banned in all jails:
 			opts, value = getopt.getopt(command[2:], "", ["expr"])
 			opts = dict(opts)
-			value = map(_parse_expr, value) if "--expr" in opts else value
-			return self.__server.banned(name, value)
+			if "--expr" in opts: value = map(_parse_expr, value)
+			return self.__server.banned(name, *value)
 		elif command[1] == "logpath":
 			return self.__server.getLogPath(name)
 		elif command[1] == "logencoding":

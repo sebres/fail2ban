@@ -522,27 +522,27 @@ class Server:
 	def setBanTime(self, name, value):
 		self.__jails[name].actions.setBanTime(value)
 	
-	def addAttemptIP(self, name, ip, failures):
-		return self.__jails[name].filter.addAttempt(ip, *failures)
+	def addAttemptIP(self, name, *args):
+		return self.__jails[name].filter.addAttempt(*args)
 
-	def setBanIP(self, name, value):
-		return self.__jails[name].actions.addBannedIP(value)
+	def setBanIP(self, name, *ids):
+		return self.__jails[name].actions.addBanned(*ids)
 
-	def setUnbanIP(self, name=None, values=None, ifexists=True):
+	def setUnbanIP(self, name=None, *ids, ifexists=True):
 		if name is not None:
 			# single jail:
 			jails = [self.__jails[name]]
 		else:
 			# in all jails:
 			jails = list(self.__jails.values())
-		# unban given or all (if values is None):
+		# unban given or all (if ids are not given):
 		cnt = 0
 		ifexists |= (name is None)
 		for jail in jails:
-			cnt += jail.actions.removeMultiBannedIP(values, ifexists=ifexists)
+			cnt += jail.actions.removeBanned(*ids, ifexists=ifexists)
 		return cnt
 		
-	def banned(self, name=None, ids=None):
+	def banned(self, name=None, *ids):
 		if name is not None:
 			# single jail:
 			jails = [self.__jails[name]]
@@ -555,12 +555,12 @@ class Server:
 			for ip in ids:
 				ret = []
 				for jail in jails:
-					if jail.actions.getBanned([ip]):
+					if jail.actions.getBanned(ip):
 						ret.append(jail.name)
 				res.append(ret)
 		else:
 			for jail in jails:
-				ret = jail.actions.getBanned(ids)
+				ret = jail.actions.getBanned(*ids)
 				if name is not None:
 					return ret
 				else:

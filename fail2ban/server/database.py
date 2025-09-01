@@ -616,17 +616,13 @@ class Fail2BanDb(object):
 		query1 = "DELETE FROM bips WHERE jail = ?"
 		query2 = "DELETE FROM bans WHERE jail = ?"
 		queryArgs = [jail.name];
-		if not len(args):
-			cur.execute(query1, queryArgs);
-			cur.execute(query2, queryArgs);
-			return
-		query1 += " AND ip = ?"
-		query2 += " AND ip = ?"
-		queryArgs.append('');
-		for ip in args:
-			queryArgs[1] = str(ip);
-			cur.execute(query1, queryArgs);
-			cur.execute(query2, queryArgs);
+		if args:
+			p = (" AND ip IN (%s)" % ','.join('?'*len(args))) if len(args) > 1 else " AND ip = ?"
+			query1 += p
+			query2 += p
+			queryArgs += map(str, args)
+		cur.execute(query1, queryArgs)
+		cur.execute(query2, queryArgs)
 
 	@commitandrollback
 	def _getBans(self, cur, jail=None, bantime=None, ip=None):

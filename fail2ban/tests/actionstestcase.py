@@ -78,10 +78,10 @@ class ExecuteActions(LogCaptureTestCase):
 		self.assertRaises(ValueError, self.__actions.removeBannedIP, '127.0.0.1')
 
 	def testAddBannedIP(self):
-		self.assertEqual(self.__actions.addBannedIP('192.0.2.1'), 1)
+		self.assertEqual(self.__actions.addBanned('192.0.2.1'), 1)
 		self.assertLogged('Ban 192.0.2.1')
 		self.pruneLog()
-		self.assertEqual(self.__actions.addBannedIP(['192.0.2.1', '192.0.2.2', '192.0.2.3']), 2)
+		self.assertEqual(self.__actions.addBanned('192.0.2.1', '192.0.2.2', '192.0.2.3'), 2)
 		self.assertLogged('192.0.2.1 already banned')
 		self.assertNotLogged('Ban 192.0.2.1')
 		self.assertLogged('Ban 192.0.2.2')
@@ -223,8 +223,8 @@ class ExecuteActions(LogCaptureTestCase):
 		self.__actions.start()
 		self.assertNotLogged("stdout: %r" % 'ip start')
 
-		self.assertEqual(self.__actions.addBannedIP('192.0.2.1'), 1)
-		self.assertEqual(self.__actions.addBannedIP('2001:db8::1'), 1)
+		self.assertEqual(self.__actions.addBanned('192.0.2.1'), 1)
+		self.assertEqual(self.__actions.addBanned('2001:db8::1'), 1)
 		self.assertLogged('Ban 192.0.2.1', 'Ban 2001:db8::1',
 			"stdout: %r" % 'ip start',
 			"stdout: %r" % 'ip ban 192.0.2.1',
@@ -234,7 +234,7 @@ class ExecuteActions(LogCaptureTestCase):
 		# check should fail (so cause stop/start):
 		self.pruneLog('[test-phase 1a] simulate inconsistent irreparable env by unban')
 		act['actioncheck?family=inet6'] = act.actioncheck + '; exit 1'
-		self.__actions.removeBannedIP('2001:db8::1')
+		self.__actions.removeBanned('2001:db8::1')
 		self.assertLogged('Invariant check failed. Unban is impossible.',
 			wait=True)
 		self.pruneLog('[test-phase 1b] simulate inconsistent irreparable env by flush')
@@ -252,7 +252,7 @@ class ExecuteActions(LogCaptureTestCase):
 		# check succeeds:
 		self.pruneLog('[test-phase 2] consistent env')
 		act['actioncheck?family=inet6'] = act.actioncheck
-		self.assertEqual(self.__actions.addBannedIP('2001:db8::1'), 1)
+		self.assertEqual(self.__actions.addBanned('2001:db8::1'), 1)
 		self.assertLogged('Ban 2001:db8::1',
 			"stdout: %r" % 'ip start',   # same for both families
 			"stdout: %r" % 'ip ban 2001:db8::1',
@@ -303,8 +303,8 @@ class ExecuteActions(LogCaptureTestCase):
 		self.__actions.start()
 		self.assertNotLogged("stdout: %r" % 'ip start')
 
-		self.assertEqual(self.__actions.addBannedIP('192.0.2.1'), 1)
-		self.assertEqual(self.__actions.addBannedIP('2001:db8::1'), 1)
+		self.assertEqual(self.__actions.addBanned('192.0.2.1'), 1)
+		self.assertEqual(self.__actions.addBanned('2001:db8::1'), 1)
 		self.assertLogged('Ban 192.0.2.1', 'Ban 2001:db8::1',
 			"stdout: %r" % 'ip start inet4',
 			"stdout: %r" % 'ip ban 192.0.2.1',
@@ -315,7 +315,7 @@ class ExecuteActions(LogCaptureTestCase):
 		# check should fail (so cause stop/start):
 		act['actioncheck?family=inet6'] = act.actioncheck + '; exit 1'
 		self.pruneLog('[test-phase 1a] simulate inconsistent irreparable env by unban')
-		self.__actions.removeBannedIP('2001:db8::1')
+		self.__actions.removeBanned('2001:db8::1')
 		self.assertLogged('Invariant check failed. Trying to restore a sane environment',
 			"stdout: %r" % 'ip stop inet6',
 			all=True, wait=True)
@@ -326,7 +326,7 @@ class ExecuteActions(LogCaptureTestCase):
 			all=True)
 
 		self.pruneLog('[test-phase 1b] simulate inconsistent irreparable env by ban')
-		self.assertEqual(self.__actions.addBannedIP('2001:db8::1'), 1)
+		self.assertEqual(self.__actions.addBanned('2001:db8::1'), 1)
 		self.assertLogged('Invariant check failed. Trying to restore a sane environment',
 			"stdout: %r" % 'ip stop inet6',
 			"stdout: %r" % 'ip start inet6',
@@ -340,7 +340,7 @@ class ExecuteActions(LogCaptureTestCase):
 			all=True)
 
 		act['actioncheck?family=inet6'] = act.actioncheck
-		self.assertEqual(self.__actions.addBannedIP('2001:db8::2'), 1)
+		self.assertEqual(self.__actions.addBanned('2001:db8::2'), 1)
 		act['actioncheck?family=inet6'] = act.actioncheck + '; exit 1'
 		self.pruneLog('[test-phase 1c] simulate inconsistent irreparable env by flush')
 		self.__actions._Actions__flushBan()
@@ -361,7 +361,7 @@ class ExecuteActions(LogCaptureTestCase):
 		# check succeeds:
 		self.pruneLog('[test-phase 2] consistent env')
 		act['actioncheck?family=inet6'] = act.actioncheck
-		self.assertEqual(self.__actions.addBannedIP('2001:db8::1'), 1)
+		self.assertEqual(self.__actions.addBanned('2001:db8::1'), 1)
 		self.assertLogged('Ban 2001:db8::1',
 			"stdout: %r" % 'ip start inet6',
 			"stdout: %r" % 'ip ban 2001:db8::1',
@@ -419,7 +419,7 @@ class ExecuteActions(LogCaptureTestCase):
 		act.actionrepair = 'echo ip repair <family>; touch "<FN>"'
 		act.actionreban = 'echo ip reban <ip> <family>; echo "<ip> <family> -- rebanned" >> "<FN>"'
 		self.pruneLog('[test-phase 0] initial ban')
-		self.assertEqual(self.__actions.addBannedIP(['192.0.2.1', '2001:db8::1']), 2)
+		self.assertEqual(self.__actions.addBanned('192.0.2.1', '2001:db8::1'), 2)
 		self.assertLogged('Ban 192.0.2.1', 'Ban 2001:db8::1',
 			"stdout: %r" % 'ip start inet4',
 			"stdout: %r" % 'ip ban 192.0.2.1 inet4',
@@ -440,7 +440,7 @@ class ExecuteActions(LogCaptureTestCase):
 		MyTime.setTime(MyTime.time() + 4)
 		# already banned produces events:
 		self.pruneLog('[test-phase 2] check already banned')
-		self.assertEqual(self.__actions.addBannedIP(['192.0.2.1', '2001:db8::1', '2001:db8::2']), 1)
+		self.assertEqual(self.__actions.addBanned('192.0.2.1', '2001:db8::1', '2001:db8::2'), 1)
 		self.assertLogged(
 			'192.0.2.1 already banned', '2001:db8::1 already banned', 'Ban 2001:db8::2',
 			"stdout: %r" % 'ip check inet4', # both checks occurred
@@ -465,7 +465,7 @@ class ExecuteActions(LogCaptureTestCase):
 		os.remove(tmp+'/inet6')
 		# test again already banned (it shall cause reban now):
 		self.pruneLog('[test-phase 3a] check reban after sane env repaired')
-		self.assertEqual(self.__actions.addBannedIP(['192.0.2.1', '2001:db8::1']), 2)
+		self.assertEqual(self.__actions.addBanned('192.0.2.1', '2001:db8::1'), 2)
 		self.assertLogged(
 			"Invariant check failed. Trying to restore a sane environment",
 			"stdout: %r" % 'ip repair inet4', # both repairs occurred
@@ -477,7 +477,7 @@ class ExecuteActions(LogCaptureTestCase):
 
 		# now last IP (2001:db8::2) - no repair, but still old epoch of ticket, so it gets rebanned:
 		self.pruneLog('[test-phase 3a] check reban by epoch mismatch (without repair)')
-		self.assertEqual(self.__actions.addBannedIP('2001:db8::2'), 1)
+		self.assertEqual(self.__actions.addBanned('2001:db8::2'), 1)
 		self.assertLogged(
 			"Reban 2001:db8::2, action 'ip'",
 			"stdout: %r" % 'ip reban 2001:db8::2 inet6',
