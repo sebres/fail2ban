@@ -28,7 +28,7 @@ import getopt
 import time
 import json
 
-from ..helpers import getLogger, logging, parseExpressions
+from ..helpers import getLogger, logging, _parse_expr
 from .. import version
 
 # Gets the instance of the logger.
@@ -119,13 +119,13 @@ class Transmitter:
 			# if all ips:
 			if "--all" in opts:
 				return self.__server.setUnbanIP()
-			value = parseExpressions(value) if "--expr" in opts else value
+			value = map(_parse_expr, value) if "--expr" in opts else value
 			return self.__server.setUnbanIP(None, value)
 		elif name == "banned":
 			# check IP is banned in all jails:
 			opts, value = getopt.getopt(command[1:], "", ["expr"])
 			opts = dict(opts)
-			value = parseExpressions(value) if "--expr" in opts else value
+			value = map(_parse_expr, value) if "--expr" in opts else value
 			return self.__server.banned(None, value)
 		elif name == "echo":
 			return command[1:]
@@ -236,17 +236,17 @@ class Transmitter:
 		elif command[1] == "addignoreip":
 			opts, value = getopt.getopt(command[2:], "", ["expr"])
 			opts = dict(opts)
-			isexpr = "--expr" in opts
+			if "--expr" in opts: value = map(_parse_expr, value)
 			for v in value:
-				self.__server.addIgnoreIP(name, parseExpressions(v) if isexpr else v)
+				self.__server.addIgnoreIP(name, v)
 			if self.__quiet: return
 			return self.__server.getIgnoreIP(name)
 		elif command[1] == "delignoreip":
 			opts, value = getopt.getopt(command[2:], "", ["expr"])
 			opts = dict(opts)
-			isexpr = "--expr" in opts
+			if "--expr" in opts: value = map(_parse_expr, value)
 			for v in value:
-				self.__server.delIgnoreIP(name, parseExpressions(v) if isexpr else v)
+				self.__server.delIgnoreIP(name, v)
 			if self.__quiet: return
 			return self.__server.getIgnoreIP(name)
 		elif command[1] == "ignorecommand":
@@ -366,8 +366,7 @@ class Transmitter:
 		elif command[1] == "attempt":
 			opts, value = getopt.getopt(command[2:], "", ["expr"])
 			opts = dict(opts)
-			if self.__quiet: return
-			ip = parseExpressions(value[0]) if "--expr" in opts else value[0]
+			ip = _parse_expr(value[0]) if "--expr" in opts else value[0]
 			return self.__server.addAttemptIP(name, ip, value[1:])
 		elif command[1].startswith("bantime."):
 			value = command[2]
@@ -378,12 +377,12 @@ class Transmitter:
 		elif command[1] == "banip":
 			opts, value = getopt.getopt(command[2:], "", ["expr"])
 			opts = dict(opts)
-			value = parseExpressions(value) if "--expr" in opts else value
+			value = map(_parse_expr, value) if "--expr" in opts else value
 			return self.__server.setBanIP(name,value)
 		elif command[1] == "unbanip":
 			opts, value = getopt.getopt(command[2:], "", ["expr", "report-absent"])
 			opts = dict(opts)
-			value = parseExpressions(value) if "--expr" in opts else value
+			value = map(_parse_expr, value) if "--expr" in opts else value
 			return self.__server.setUnbanIP(name, value, ifexists=("--report-absent" not in opts))
 		elif command[1] == "addaction":
 			args = [command[2]]
@@ -459,7 +458,7 @@ class Transmitter:
 			# check IP is banned in all jails:
 			opts, value = getopt.getopt(command[2:], "", ["expr"])
 			opts = dict(opts)
-			value = parseExpressions(value) if "--expr" in opts else value
+			value = map(_parse_expr, value) if "--expr" in opts else value
 			return self.__server.banned(name, value)
 		elif command[1] == "logpath":
 			return self.__server.getLogPath(name)

@@ -318,15 +318,13 @@ def _merge_copy_dicts(x, y):
 	"""
 	return {**x, **y}
 
-def parseExpressions(value):
-	def parseExpr(v):
-		try:
-			return literal_eval(v)
-		except SyntaxError:
-			return v
-	if value:
-		return list(map(parseExpr, value)) if isinstance(value, (list, tuple)) else parseExpr(value)
-	return None
+def _parse_expr(v):
+	"""Helper to convert pythonic expression to python object.
+	"""
+	try:
+		return literal_eval(v)
+	except SyntaxError:
+		return v
 
 #
 # Following function used for parse options from parameter (e.g. `name[p1=0, p2="..."][p3='...']`).
